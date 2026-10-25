@@ -1,0 +1,39 @@
+# --- build stage -----------------------------------------------------------
+FROM rust:1.75-alpine AS build
+
+RUN apk add --no-cache musl-dev gcc
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Static musl binary, size-optimised
+RUN cargo build --release --locked
+
+# Directories the daemon expects in the runtime image
+RUN mkdir -p /out/etc/switch /out/run/switch
+
+# --- runtime stage ---------------------------------------------------------
+FROM alpine:3.19
+
+# Install ttyd (web terminal) and bash/libc compatibility
+RUN apk add --no-cache ttyd ncurses
+
+# Copy compiled switch binary from build stage
+COPY --from=build /src/target/release/switch /usr/local/bin/switch
+COPY --from=build /out/etc/switch /etc/switch
+COPY --from=build /out/run/switch /run/switch
+
+# Expose HTTP port for the web browser / platform
+EXPOSE 8080
+
+# Create a startup script to run both the daemon and the web terminal UI
+RUN echo -e '#!/bin/sh\n\
+# Start the switch daemon in the background\n\
+/usr/local/bin/switch daemon --tcp 2200 &\n\
+sleep 1\n\
+# Launch ttyd wrapping the switch CLI so it displays in the browser\n\
+exec ttyd -p 8080 -w /usr/local/bin/switch cli\n\
+' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
