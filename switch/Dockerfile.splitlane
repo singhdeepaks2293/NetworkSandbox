@@ -24,19 +24,11 @@ COPY --from=build /src/target/release/switch /switch
 COPY --from=build /out/etc/switch /etc/switch
 COPY --from=build /out/run/switch /run/switch
 
+# Copy the startup script and make it executable
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # Expose HTTP port for the web browser / platform
 EXPOSE 8080
-
-# Create a clean startup script using EOF to prevent execution errors
-RUN cat << 'EOF' > /entrypoint.sh
-#!/bin/sh
-# Start the switch daemon in the background on port 2200
-/switch daemon --tcp 2200 &
-sleep 1
-# Launch ttyd wrapping the switch CLI so it displays in the browser on port 8080
-exec ttyd -p 8080 -w /switch cli
-EOF
-
-RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
