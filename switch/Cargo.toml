@@ -1,0 +1,20 @@
+[package]
+name = "switch"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny educational Ethernet switch with a vendor-neutral CLI, IEEE 802.1Q-2005 VLAN bridging and Multiple Spanning Tree Protocol (MSTP)"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "switch"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

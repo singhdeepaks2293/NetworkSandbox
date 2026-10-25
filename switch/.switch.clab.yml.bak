@@ -1,0 +1,42 @@
+name: stp-lab
+
+# Two switches with two parallel links (a deliberate loop) plus two hosts.
+# STP/PVST must elect one root and block one of the parallel links.
+#
+#   sw1:eth1 ---- sw2:eth1
+#   sw1:eth2 ---- sw2:eth2
+#   sw1:eth3 ---- pc1:eth1
+#   sw2:eth3 ---- pc2:eth1
+#
+# Deploy:
+#   docker build -t switch:latest .
+#   containerlab deploy -t switch.clab.yml
+#   docker exec -it clab-stp-lab-sw1 /switch cli -c "show bridge"
+#
+# The CLI is also reachable over TCP (telnet-style) on port 2200:
+#   docker exec -it clab-stp-lab-sw1 /switch cli --host 172.20.20.11 --port 2200
+
+topology:
+  nodes:
+    sw1:
+      kind: linux
+      image: switch:latest
+      cmd: daemon --ports eth1,eth2,eth3 --tcp 2200 --hostname sw1
+    sw2:
+      kind: linux
+      image: switch:latest
+      cmd: daemon --ports eth1,eth2,eth3 --tcp 2200 --hostname sw2
+    pc1:
+      kind: linux
+      image: alpine:3.19
+      cmd: sleep infinity
+    pc2:
+      kind: linux
+      image: alpine:3.19
+      cmd: sleep infinity
+
+  links:
+    - endpoints: ["sw1:eth1", "sw2:eth1"]
+    - endpoints: ["sw1:eth2", "sw2:eth2"]
+    - endpoints: ["sw1:eth3", "pc1:eth1"]
+    - endpoints: ["sw2:eth3", "pc2:eth1"]

@@ -1,0 +1,47 @@
+!
+version 1.0
+device name access-sw1
+!
+feature enable vlan
+feature enable stp
+feature enable mstp
+feature enable trunking
+feature enable mac-learning
+feature enable portfast
+feature enable bpdu-guard
+feature enable lldp
+feature disable telnet
+!
+mac aging 300
+!
+vlan create 1 name default
+vlan create 10 name users
+vlan create 20 name voice
+vlan create 99 name management
+!
+port eth1
+ description uplink-to-core
+ mode trunk
+ native vlan 99
+ allow vlans 1,10,20,99
+!
+port eth2
+ access vlan 10
+ edge on
+ guard on
+!
+port eth3
+ access vlan 20
+ edge on
+ guard on
+!
+spanning-tree mode mstp
+bridge priority 4096
+bridge mst name EXAMPLE-REGION
+bridge mst revision 1
+bridge mst max-hops 20
+bridge mst instance 1 vlan 10
+bridge mst instance 1 priority 4096
+bridge mst instance 2 vlan 20,99
+!
+end
