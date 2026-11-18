@@ -1,5 +1,9 @@
 # VELA NGFW Feature Checklist
 
+> Update 2026-11-18 (second NGFW pass): App-ID stream reassembly (in-order TCP, 4 KB per direction, retransmission trimming), PAN-OS-style default rules (intrazone/interzone per VDOM, per-zone overrides) and User-ID (static and pushed mappings with timeouts, nested user groups, user-based policy in all three CLIs and a REST API). `cargo test` 102/102, including engine tests for a split ClientHello, default rules and User-ID logins; manual daemon run of User-ID and default rules over the CLI.
+
+> Update 2026-11-18 (NGFW pass): content-based App-ID with two-stage policy evaluation, `application-default`, list-valued policies with negation, service/application/profile groups, static routes with LPM and distance, a separate SNAT rulebase, live zone membership changes, and FortiOS-style and PAN-OS-style CLIs. Verified with `cargo test` (92/92, including engine tests that run TCP handshakes and App-ID verdicts through the packet path with synthetic frames) and a manual run of both CLI styles against the daemon over TCP. Not yet run in containerlab.
+
 > Update 2026-11-18 (after the audit below): a hardening pass added a TCP state machine, SYN-only flow creation, reply-direction inspection, fragment/martian/LAND/bad-flag drops, ICMP Time Exceeded / Unreachable, a Reject action, policy enable/disable/name/hit counters, UDP flood limit, session limits and O(1) PAT port allocation. This pass was ported from `firewall-new/`, then verified with `cargo test` (41/41), the two-firewall containerlab chain (10/10) and the single-firewall containerlab policy test (4/4). Features exercised only by unit tests remain marked `[~]`.
 
 Audit date: 2026-11-18  
@@ -73,9 +77,9 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [~] Link status: the UI infers "up" from an assigned address; it does not query kernel link state.
 - [~] RX/TX bytes exist in monitoring JSON, but the interface table shows packets only.
 - [~] Interface errors: aggregate errors exist; per-interface error counters are not exposed.
-- [ ] IPv6 addresses, filtering and routes.
-- [ ] General static routes; only one default route per VDOM is supported.
-- [ ] Multiple gateways / gateway objects.
+- [x] IPv6 addresses, filtering and routes (dual stack; engine-tested with NDP, ICMPv6, stateful TCP, App-ID).
+- [x] Static routes with longest-prefix match and administrative distance; several default routes per VDOM.
+- [~] Multiple gateways through several routes with different distances; no gateway objects or health checks.
 - [ ] DHCP client.
 - [ ] VLAN interfaces.
 - [ ] DNS configuration page.
@@ -86,7 +90,7 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 ## 5. Stateful firewall
 
 - [x] IPv4 filtering.
-- [ ] IPv6 filtering.
+- [x] IPv6 filtering (same policy engine as IPv4).
 - [x] TCP, UDP and ICMP filtering.
 - [x] Connection tracking and stateful return traffic.
 - [~] TCP state model: SYN_SENT/SYN_RECV/ESTABLISHED/CLOSING/TIME_WAIT/CLOSED with per-state timeouts, INVALID packets dropped; no sequence-window checks, no RELATED tracking for ICMP errors/helpers. Unit-tested and exercised by the containerlab TCP flow.
@@ -97,7 +101,7 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [x] Zone-pair filtering.
 - [~] Interface-based filtering only through interface-to-zone mapping; no explicit ingress/egress interface rule fields.
 - [x] Address objects and address groups.
-- [ ] Service groups.
+- [x] Service groups (nested), service objects with port lists and ranges.
 - [x] Rule ordering by ascending rule ID.
 - [~] Rule enable/disable (`disable` policy option): implemented and unit-tested; not yet run in a lab.
 - [~] Rule names (`name <word>` policy option): implemented and unit-tested.
@@ -126,14 +130,14 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [ ] NAT event logging with translated addresses/ports.
 - [x] NAT translation monitoring in the session table.
 - [x] NAT configuration through full config editor/API.
-- [~] NAT configuration through CLI/UI: DNAT is visible; there are no dedicated NAT add/edit forms or CLI NAT commands.
+- [x] NAT configuration through the FortiOS-style (VIP, central SNAT) and PAN-OS-style (`rulebase nat`) CLIs; separate `snat` rulebase in the config language.
 - [ ] nftables/kernel NAT implementation.
 - [x] NAT tested in an actual packet-forwarding chain (SNAT on both hops, DNAT, return traffic).
 
 ## 7. Policy management
 
 - [x] Rule ID.
-- [ ] Rule name.
+- [x] Rule name.
 - [ ] Rule description.
 - [x] Source zone.
 - [x] Destination zone.
@@ -145,10 +149,10 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [x] Destination port/service.
 - [x] Application restriction field.
 - [ ] Schedule.
-- [~] Security profiles: separate app/URL/IPS/AV fields exist; no single reusable security-profile object.
+- [x] Security profiles per policy, or a reusable profile group (`profile-group`).
 - [x] Logging toggle.
 - [x] Action.
-- [ ] Enabled/disabled state.
+- [x] Enabled/disabled state.
 - [ ] Drag-and-drop rule ordering.
 - [~] Search/filter/sorting: API supports text filtering for sessions/logs; policy table has no UI search/sort/filter.
 - [ ] Rule duplication.
@@ -162,7 +166,7 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 
 ## 8. Deep Packet Inspection
 
-- [~] Protocol identification: mostly configured app-definition matching by protocol/port, not content-based protocol identification.
+- [x] Content-based protocol identification (App-ID, `appid.rs`): ~50 applications, client- and server-first signatures; unit-tested and exercised with synthetic frames through the engine.
 - [x] HTTP metadata inspection (`Host`).
 - [x] TLS metadata inspection (ClientHello SNI).
 - [ ] DNS inspection.
@@ -170,7 +174,7 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [~] Configurable inspection rules: literal URL/signature entries, not a general rule language.
 - [x] Inspection event logging.
 - [x] Metadata-vs-encrypted-payload limitation documented (README).
-- [~] One-packet inspection only; split TCP requests may be missed.
+- [~] App-ID reassembles split requests (in-order, 4 KB); URL/IPS/AV inspection is still one packet at a time.
 
 ## 9. Intrusion Prevention System
 
@@ -190,13 +194,13 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 
 ## 10. Application control
 
-- [~] Application identification by configured protocol/port (`app-def`).
-- [ ] Application categories.
+- [x] Content-based application identification, with port-defined custom applications.
+- [x] Application categories, subcategories, risk and parent; `category:<name>` in policies and app groups.
 - [x] Allow/block through policy application field.
 - [ ] Application usage statistics.
 - [x] Application-based firewall rules.
-- [~] Unknown application handling: unmatched apps simply do not match; no explicit unknown policy.
-- [ ] Content/metadata-based classification.
+- [x] Unknown applications become `unknown-tcp`/`unknown-udp` after four payload packets and are matched like any other app.
+- [x] Content/metadata classification (HTTP Host, TLS SNI → SaaS apps).
 - [ ] Top-application dashboard/report.
 
 ## 11. DNS security
@@ -227,17 +231,17 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 
 ## 13. TLS inspection
 
-- [ ] Optional TLS interception module.
-- [ ] Certificate authority management.
+- [~] TLS interception engine (verify-first MITM, forged certificates, plaintext URL/IPS/AV, 403 replacement page) tested with rustls; not yet connected to the dataplane (needs a userspace TCP proxy).
+- [x] Inspection CA generation (`ssl-ca-generate`), reload, per-name certificate cache.
 - [ ] Inspection policies.
-- [ ] Certificate validation.
-- [ ] Exclusion lists.
+- [x] Upstream certificate validation before impersonation (Mozilla roots + extra roots).
+- [~] Exemption list in the engine (not yet configurable).
 - [ ] Certificate generation and rotation.
 - [ ] TLS inspection logging.
 - [ ] Explicit administrative enablement and trust deployment.
 - [ ] Encrypted private-key storage.
 - [ ] Pinning/mTLS/QUIC compatibility documentation.
-- [ ] Any TLS interception implementation at all.
+- [~] TLS interception implementation: engine done and tested; dataplane integration pending.
 
 ## 14. Malware protection
 
@@ -268,16 +272,16 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 
 ## 16. VPN
 
-- [ ] WireGuard management.
+- [x] WireGuard: protocol implemented in Rust, interop-tested with boringtun in both directions (with and without preshared key).
 - [ ] IPsec management.
-- [ ] Peer management.
-- [ ] Tunnel configuration.
-- [ ] Allowed IPs.
-- [ ] Tunnel status.
-- [ ] Peer statistics.
-- [ ] Key management.
+- [x] Peer management (public key, preshared key, endpoint, allowed IPs, keepalive).
+- [x] Tunnel configuration (tunnel as an interface in a zone).
+- [x] Allowed IPs: cryptokey routing out, source check in.
+- [x] Tunnel status (`show vpn`).
+- [x] Peer statistics (rx/tx bytes, last handshake).
+- [x] Key generation (`wg-genkey` / `wg-pubkey`).
 - [ ] Connection logs.
-- [ ] VPN firewall policies.
+- [x] VPN firewall policies (zone-based; tested site-to-site with two engines).
 - [ ] Kernel module/capability documentation.
 - [~] `/api/v1/vpn` exists but returns an empty placeholder.
 - [ ] VPN UI pages.
@@ -620,3 +624,36 @@ containerlab-policy.sh: ALL CHECKS PASSED (4/4)
 containerlab-chain.sh: ALL CHECKS PASSED (10/10)
 healthz: {"product":"VELA NGFW","status":"ok","version":"0.1.0"}
 ```
+
+## Vendor-style management (added in the NGFW pass)
+
+- [x] Per-connection CLI style (`cli-style native|fortios|panos`, default from `system cli-style`).
+- [x] FortiOS-style `config`/`edit`/`set`/`next`/`end`/`abort`, applied on `next`/`end`, required-field checks, `edit 0` auto ids, VDOM context.
+- [x] FortiOS-style tables: interfaces, zones, addresses, groups, services, service groups, application groups, policies, VIPs, central SNAT, static routes, web filter, IPS, antivirus, shapers.
+- [x] FortiOS-style tools: `show`, `get system status`, `get router info routing-table all`, `diagnose sys session list`, `diagnose firewall iprope lookup`.
+- [x] PAN-OS-style operational/configuration modes, candidate config with `commit`/`revert`, a failed commit keeps the candidate.
+- [x] PAN-OS-style objects: zones, addresses, groups, services, service groups, application groups, URL/vulnerability/virus profiles, profile groups, security and NAT rulebases, static routes, `vsys`.
+- [x] PAN-OS-style tools: `test security-policy-match`, `show running security-policy`, `show session all`, `move`/`rename` rules.
+- [x] Read-only roles can show but not change configuration in both styles.
+- [ ] PAN-OS default intrazone/interzone rules.
+- [ ] FortiGuard numeric category/application ids.
+- [x] Default intrazone/interzone rules (PAN-OS `default-security-rules`, FortiOS zone `intrazone`); deny unless configured.
+
+## User identity (added in the second NGFW pass)
+
+- [x] Static IP-to-user mappings (`user-map`), dynamic mappings with timeouts via CLI and REST.
+- [x] Nested user groups; policies match users, groups, `known-user`, `unknown`.
+- [x] User shown in sessions and used when App-ID re-evaluates a flow.
+- [ ] LDAP/AD group lookup, agentless log scraping, captive portal.
+
+## High availability (added in the HA pass)
+
+- [x] Active/passive pair: HMAC-SHA256 signed heartbeats with replay protection, priority election, optional preemption.
+- [x] Split-brain resolution by rank when the HA link returns.
+- [x] Passive unit drops all traffic and ARP; new active sends gratuitous ARP.
+- [x] Config sync with node-local hostname/HA/management settings.
+- [x] Session sync (TCP state, NAT, App-ID, user) so established flows survive failover.
+- [x] Manual suspend/resume in all three CLIs.
+- [x] Tested with two units in one process over UDP: election, sync, failover with a mid-flow packet, restart without preempt, suspend, split brain.
+- [ ] Active/active, interface/link monitoring, virtual MACs, incremental session sync.
+

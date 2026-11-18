@@ -6,7 +6,7 @@
 //! a partially installed ruleset behind. The userspace dataplane remains the
 //! default path; callers opt into kernel enforcement explicitly.
 
-use crate::model::{Action, AddrRef, Cidr, Config, DnatRule, Policy, Proto};
+use crate::model::{Action, AddrRef, Cidr, Config, DnatRule, Policy, Proto, SnatTarget, APPLICATION_DEFAULT};
 use netlink_packet_core::{
     DefaultNla, NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_APPEND,
     NLM_F_CREATE, NLM_F_REQUEST,
@@ -145,6 +145,62 @@ fn plan_inner(cfg: &Config) -> Result<Vec<NfTablesMessage>, String> {
         }
     }
 
+    // Default rules set to allow: intrazone pairs within each zone, and
+    // interzone pairs across zones. Denies need nothing: the chain drops.
+    for vdom in &cfg.vdoms {
+        let mut zones: Vec<&str> = cfg.interfaces.iter().filter(|i| &i.vdom == vdom).map(|i| i.zone.as_str()).collect();
+        zones.sort();
+        zones.dedup();
+        for from in &zones {
+            for to in &zones {
+                let Some(d) = cfg.default_rule_for(vdom, from, to) else { continue };
+                if d.action != Action::Permit {
+                    continue;
+                }
+                for src_iface in zone_ifaces(cfg, vdom, from) {
+                    for dst_iface in zone_ifaces(cfg, vdom, to) {
+                        let mut exprs = Vec::new();
+                        exprs.extend(meta_matches(MetaKey::Iifname, cstring(&src_iface)));
+                        exprs.extend(meta_matches(MetaKey::Oifname, cstring(&dst_iface)));
+                        exprs.push(counter());
+                        if d.log && cfg.settings.logging {
+                            exprs.push(log_expr("vela "));
+                        }
+                        exprs.push(verdict_expr(NF_ACCEPT));
+                        messages.push(rule("forward", exprs));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut snat_rules: Vec<_> = cfg.snat.iter().filter(|r| r.enabled).collect();
+    snat_rules.sort_by_key(|rule| rule.id);
+    for snat in snat_rules {
+        if snat.to != SnatTarget::Masquerade {
+            return Err(format!("snat {}: the kernel backend supports masquerade only", snat.id));
+        }
+        let sources = resolve_list(cfg, &snat.src)?;
+        let destinations = resolve_list(cfg, &snat.dst)?;
+        for src_iface in zones_ifaces(cfg, &snat.vdom, &snat.src_zones) {
+            for dst_iface in zones_ifaces(cfg, &snat.vdom, &snat.dst_zones) {
+                for source in &sources {
+                    for destination in &destinations {
+                        let mut exprs = Vec::new();
+                        exprs.extend(meta_matches(MetaKey::Iifname, cstring(&src_iface)));
+                        exprs.extend(meta_matches(MetaKey::Oifname, cstring(&dst_iface)));
+                        exprs.extend(cidr_matches(12, *source)?);
+                        exprs.extend(cidr_matches(16, *destination)?);
+                        exprs.push(counter());
+                        exprs.push(masq());
+                        exprs.push(verdict_expr(NF_ACCEPT));
+                        messages.push(rule("postrouting", exprs));
+                    }
+                }
+            }
+        }
+    }
+
     let mut dnat_rules: Vec<&DnatRule> = cfg.dnat.iter().collect();
     dnat_rules.sort_by_key(|rule| rule.id);
     for dnat in dnat_rules {
@@ -211,11 +267,49 @@ fn state_rule(state: u32, verdict: u32) -> Vec<Expr> {
     ]
 }
 
+/// The kernel backend enforces addresses, zones, protocols and ports. App-ID,
+/// address negation and the services that depend on them stay in the
+/// userspace engine; a policy that needs them is refused rather than widened.
+fn kernel_supported(cfg: &Config, policy: &Policy) -> Result<(), String> {
+    if policy.negate_src || policy.negate_dst {
+        return Err(format!("policy {}: address negation is enforced only by the userspace engine", policy.id));
+    }
+    for app in &policy.apps {
+        if app != "any" && !cfg.apps.iter().any(|a| &a.name == app) {
+            return Err(format!("policy {}: application '{app}' needs App-ID, which only the userspace engine enforces", policy.id));
+        }
+    }
+    if policy.services.iter().any(|s| s == APPLICATION_DEFAULT) && !policy.names_app() {
+        return Err(format!("policy {}: application-default without an application needs App-ID", policy.id));
+    }
+    Ok(())
+}
+
+fn resolve_list(cfg: &Config, list: &[AddrRef]) -> Result<Vec<Cidr>, String> {
+    let mut out = Vec::new();
+    for reference in list {
+        out.extend(resolve_cidrs(cfg, reference, 0)?);
+    }
+    Ok(dedup(out))
+}
+
+fn zones_ifaces(cfg: &Config, vdom: &str, zones: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = if zones.iter().any(|z| z == "any") {
+        cfg.interfaces.iter().filter(|i| i.vdom == vdom).map(|i| i.name.clone()).collect()
+    } else {
+        zones.iter().flat_map(|z| zone_ifaces(cfg, vdom, z)).collect()
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn policy_rules(cfg: &Config, policy: &Policy) -> Result<Vec<NfTablesMessage>, String> {
-    let sources = resolve_cidrs(cfg, &policy.src, 0)?;
-    let destinations = resolve_cidrs(cfg, &policy.dst, 0)?;
-    let src_ifaces = zone_ifaces(cfg, &policy.vdom, &policy.src_zone);
-    let dst_ifaces = zone_ifaces(cfg, &policy.vdom, &policy.dst_zone);
+    kernel_supported(cfg, policy)?;
+    let sources = resolve_list(cfg, &policy.src)?;
+    let destinations = resolve_list(cfg, &policy.dst)?;
+    let src_ifaces = zones_ifaces(cfg, &policy.vdom, &policy.src_zones);
+    let dst_ifaces = zones_ifaces(cfg, &policy.vdom, &policy.dst_zones);
     if sources.is_empty()
         || destinations.is_empty()
         || src_ifaces.is_empty()
@@ -276,44 +370,83 @@ struct Selector {
     action: Action,
 }
 
-fn selectors(cfg: &Config, policy: &Policy) -> Option<Vec<Selector>> {
-    let service = policy
-        .service
-        .as_ref()
-        .and_then(|name| cfg.services.iter().find(|s| &s.name == name));
-    let service_proto = service.map(|s| s.proto).unwrap_or(Proto::Any);
-    let service_port = service.and_then(|s| s.port);
-    let proto = match (policy.proto, service_proto) {
-        (Proto::Any, other) => other,
-        (left, Proto::Any) => left,
-        (left, right) if left == right => left,
-        _ => return None,
-    };
-    let port = service_port.or(policy.dst_port);
+/// Largest port range expanded into individual kernel rules.
+const MAX_RANGE: u16 = 64;
 
-    let proto_numbers: Vec<Option<u8>> = match (proto, port) {
-        (Proto::Any, Some(_)) => vec![Some(6), Some(17)],
-        (Proto::Any, None) => vec![None],
-        (proto, _) => vec![proto.number()],
-    };
-
-    let mut out = Vec::new();
-    for proto_number in proto_numbers {
-        let mut exprs = Vec::new();
-        if let Some(number) = proto_number {
-            exprs.extend(meta_matches(MetaKey::L4Proto, vec![number]));
+/// Flatten a service or service group into (protocol, port) pairs.
+fn service_tuples(cfg: &Config, name: &str, depth: usize, out: &mut Vec<(Proto, Option<u16>)>) {
+    if depth > 16 {
+        return;
+    }
+    if let Some(service) = cfg.services.iter().find(|s| s.name == name) {
+        if service.ports.is_empty() {
+            out.push((service.proto, None));
         }
-        if let Some(port) = port {
-            if matches!(proto_number, Some(6) | Some(17)) {
-                exprs.extend(port_matches(port));
+        for (lo, hi) in &service.ports {
+            if hi - lo >= MAX_RANGE {
+                // Too wide to expand: match the protocol only would widen the
+                // rule, so leave the range to the userspace engine.
+                continue;
+            }
+            for port in *lo..=*hi {
+                out.push((service.proto, Some(port)));
             }
         }
-        out.push(Selector {
-            exprs,
-            action: policy.action,
-        });
+    } else if let Some(group) = cfg.service_groups.iter().find(|g| g.name == name) {
+        for member in &group.members {
+            service_tuples(cfg, member, depth + 1, out);
+        }
     }
-    Some(out)
+}
+
+fn selectors(cfg: &Config, policy: &Policy) -> Option<Vec<Selector>> {
+    let mut tuples: Vec<(Proto, Option<u16>)> = Vec::new();
+    if policy.names_app() {
+        // Only custom (port-defined) applications reach here; see kernel_supported.
+        for app in &policy.apps {
+            if let Some(a) = cfg.apps.iter().find(|a| &a.name == app) {
+                tuples.push((a.proto, Some(a.port)));
+            }
+        }
+    } else if policy.services.is_empty() {
+        tuples.push((Proto::Any, policy.dst_port));
+    } else {
+        for name in &policy.services {
+            if name == "any" {
+                tuples.push((Proto::Any, None));
+            } else {
+                service_tuples(cfg, name, 0, &mut tuples);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (service_proto, port) in tuples {
+        let proto = match (policy.proto, service_proto) {
+            (Proto::Any, other) => other,
+            (left, Proto::Any) => left,
+            (left, right) if left == right => left,
+            _ => continue,
+        };
+        let proto_numbers: Vec<Option<u8>> = match (proto, port) {
+            (Proto::Any, Some(_)) => vec![Some(6), Some(17)],
+            (Proto::Any, None) => vec![None],
+            (proto, _) => vec![proto.number()],
+        };
+        for proto_number in proto_numbers {
+            let mut exprs = Vec::new();
+            if let Some(number) = proto_number {
+                exprs.extend(meta_matches(MetaKey::L4Proto, vec![number]));
+            }
+            if let Some(port) = port {
+                if matches!(proto_number, Some(6) | Some(17)) {
+                    exprs.extend(port_matches(port));
+                }
+            }
+            out.push(Selector { exprs, action: policy.action });
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn dnat_expressions(dnat: &DnatRule) -> Result<Vec<Expr>, String> {
@@ -362,6 +495,8 @@ fn resolve_cidrs(cfg: &Config, reference: &AddrRef, depth: usize) -> Result<Vec<
     }
     match reference {
         AddrRef::Cidr(cidr) => Ok(vec![*cidr]),
+        // IPv6 prefixes are enforced by the userspace engine only.
+        AddrRef::Cidr6(_) => Ok(Vec::new()),
         AddrRef::Named(name) => {
             if let Some(object) = cfg.addresses.iter().find(|a| &a.name == name) {
                 return Ok(object.entries.clone());
@@ -410,7 +545,10 @@ fn cidr_matches(offset: u32, cidr: Cidr) -> Result<Vec<Expr>, String> {
     if cidr.prefix == 0 {
         return Ok(Vec::new());
     }
-    let mut exprs = vec![payload(PAYLOAD_NETWORK, offset, 4)];
+    // The table is family inet: without this guard an IPv4 address match
+    // would compare bytes of an IPv6 header.
+    let mut exprs = meta_matches(MetaKey::Nfproto, vec![NFPROTO_IPV4 as u8]);
+    exprs.push(payload(PAYLOAD_NETWORK, offset, 4));
     if cidr.prefix < 32 {
         let mask = u32::MAX << (32 - cidr.prefix as u32);
         exprs.push(named_expr(
@@ -760,6 +898,14 @@ mod tests {
         assert_eq!(exprs.len(), 3);
         assert!(!debug.contains("payload"));
         assert!(!debug.contains("cmp"));
+    }
+
+    #[test]
+    fn ipv4_address_matches_are_guarded_by_nfproto() {
+        let exprs = cidr_matches(12, Cidr::parse("10.0.0.0/8").unwrap()).unwrap();
+        let debug = format!("{exprs:?}");
+        assert!(debug.contains("Nfproto"), "{debug}");
+        assert!(cidr_matches(12, Cidr::ANY).unwrap().is_empty(), "any needs no guard and matches both families");
     }
 
     #[test]

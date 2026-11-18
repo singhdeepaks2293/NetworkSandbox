@@ -1,8 +1,8 @@
 [package]
 name = "firewall"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A tiny educational stateful IPv4 firewall with a vendor-neutral CLI and a built-in web GUI"
+description = "A lightweight educational next-generation IPv4 firewall in Rust: App-ID, zone-based list policies, NAT rulebases, FortiOS- and PAN-OS-style CLIs and a web GUI"
 license = "MIT"
 
 [dependencies]
@@ -11,12 +11,21 @@ libc = "0.2"
 netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
 netlink-sys = "0.8"
+ring = "0.17"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+webpki-roots = "0.26"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# Independent WireGuard implementation, used only to test interoperability.
+boringtun = { version = "0.7", default-features = false }
 
 [[bin]]
 name = "firewall"

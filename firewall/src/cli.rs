@@ -65,6 +65,8 @@ fn handle_client(engine: &Engine, auth: &Auth, stream: TcpStream) {
     let mut writer = stream;
     let mut line = String::new();
     let mut session: Option<Session> = None;
+    // Vendor-style front end for this connection; None is the native CLI.
+    let mut style: Option<Box<dyn crate::style::Style>> = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -75,12 +77,39 @@ fn handle_client(engine: &Engine, auth: &Auth, stream: TcpStream) {
         let line = line.trim();
         let response = match session.as_ref() {
             Some(session) => {
-                if !authorized(session, line) {
-                    "error: permission denied for this role".to_string()
-                } else {
-                    let response = execute(engine, line);
-                    auth.audit(&session.username, "cli.command", audit_detail(line));
-                    response
+                let hostname = engine.cfg.read().unwrap().settings.hostname.clone();
+                let mut words = line.split_whitespace();
+                match (words.next(), words.next()) {
+                    (Some("cli-style"), Some(name)) => match crate::style::by_name(name) {
+                        Ok(next) => {
+                            style = next;
+                            auth.audit(&session.username, "cli.style", name);
+                            format!("cli style: {name}")
+                        }
+                        Err(e) => format!("error: {e}"),
+                    },
+                    (Some("cli-style"), None) => {
+                        format!("cli style: {}", style.as_ref().map(|s| s.name()).unwrap_or("native"))
+                    }
+                    (Some("prompt"), None) => match &style {
+                        Some(s) => s.prompt(&hostname),
+                        None => format!("{hostname}> "),
+                    },
+                    (Some("quit"), None) => "bye".to_string(),
+                    _ => match style.as_mut() {
+                        Some(s) => {
+                            let ctx = crate::style::Ctx { store: engine, can_write: session.role.can_write() };
+                            let response = s.exec(line, &ctx);
+                            auth.audit(&session.username, "cli.command", audit_detail(line));
+                            response
+                        }
+                        None if !authorized(session, line) => "error: permission denied for this role".to_string(),
+                        None => {
+                            let response = execute(engine, line);
+                            auth.audit(&session.username, "cli.command", audit_detail(line));
+                            response
+                        }
+                    },
                 }
             }
             None => match authenticate_line(auth, line) {
@@ -92,6 +121,8 @@ fn handle_client(engine: &Engine, auth: &Auth, stream: TcpStream) {
                         new_session.role.as_str()
                     );
                     session = Some(new_session);
+                    let default_style = engine.cfg.read().unwrap().settings.cli_style.clone();
+                    style = crate::style::by_name(&default_style).unwrap_or(None);
                     response
                 }
                 Ok(None) if matches!(line, "help" | "?") => help(),
@@ -106,7 +137,7 @@ fn handle_client(engine: &Engine, auth: &Auth, stream: TcpStream) {
         {
             break;
         }
-        if session.is_none() && matches!(line, "quit" | "exit") {
+        if response == "bye" {
             break;
         }
     }
@@ -162,7 +193,7 @@ pub fn execute(engine: &Engine, line: &str) -> String {
         ("show", Some("version")) => {
             let cfg = engine.cfg.read().unwrap();
             format!(
-                "firewall 0.1.0\nhostname {}\nuptime {}s\nsessions {}",
+                "firewall 0.2.0\nhostname {}\nuptime {}s\nsessions {}",
                 cfg.settings.hostname,
                 engine.uptime_secs(),
                 engine.sessions.lock().unwrap().len()
@@ -173,6 +204,50 @@ pub fn execute(engine: &Engine, line: &str) -> String {
         ("show", Some("policies" | "policy")) => show_policies(engine),
         ("show", Some("sessions" | "conntrack")) => show_sessions(engine),
         ("show", Some("stats")) => show_stats(engine),
+        ("show", Some("applications")) => crate::appid::catalog_text(words.get(2).copied()),
+        ("show", Some("ha")) => engine.ha.lock().unwrap().text(),
+        ("show", Some("vpn")) => engine.vpn_status(),
+        ("ha", Some("suspend")) => {
+            engine.ha_suspended.store(true, std::sync::atomic::Ordering::SeqCst);
+            "ha: this unit is suspended and will not be active until 'ha resume'".to_string()
+        }
+        ("ha", Some("resume")) => {
+            engine.ha_suspended.store(false, std::sync::atomic::Ordering::SeqCst);
+            "ha: this unit is eligible again".to_string()
+        }
+        ("show", Some("users")) => {
+            let cfg = engine.cfg.read().unwrap().clone();
+            let mut out = format!("{:<20} {:<24} {:<8} {}\n", "address", "user", "source", "expires");
+            for (ip, user, source, left) in engine.user_mappings(&cfg) {
+                let left = left.map(|s| format!("{s}s")).unwrap_or_else(|| "never".into());
+                out.push_str(&format!("{ip:<20} {user:<24} {source:<8} {left}\n"));
+            }
+            out
+        }
+        ("user-id", Some("login")) => {
+            // user-id login <ip> <user> [timeout <seconds>]
+            let (Some(ip), Some(user)) = (words.get(2), words.get(3)) else {
+                return "usage: user-id login <ip> <user> [timeout <seconds>]".to_string();
+            };
+            let Ok(ip) = ip.parse() else { return format!("error: invalid address {ip}") };
+            let timeout = match (words.get(4), words.get(5)) {
+                (Some(&"timeout"), Some(secs)) => match secs.parse::<u64>() {
+                    Ok(s) => Some(Duration::from_secs(s)),
+                    Err(_) => return "error: invalid timeout".to_string(),
+                },
+                (None, _) => None,
+                _ => return "usage: user-id login <ip> <user> [timeout <seconds>]".to_string(),
+            };
+            match engine.user_login(ip, user, timeout) {
+                Ok(()) => format!("mapped {ip} to {user}"),
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        ("user-id", Some("logout")) => match words.get(2).and_then(|ip| ip.parse().ok()) {
+            Some(ip) if engine.user_logout(ip) => format!("removed mapping for {ip}"),
+            Some(ip) => format!("no dynamic mapping for {ip}"),
+            None => "usage: user-id logout <ip>".to_string(),
+        },
         ("policy", Some("add")) => policy_add(engine, &words[2..]),
         ("policy", Some("delete" | "del")) => policy_delete(engine, &words[2..]),
         ("save" | "write", _) => match engine.save() {
@@ -186,10 +261,13 @@ pub fn execute(engine: &Engine, line: &str) -> String {
 fn help() -> String {
     [
         "commands:",
-        "  show version | config | interfaces | policies | sessions | stats",
+        "  show version | config | interfaces | policies | sessions | stats | applications [filter]",
         "  policy add [vdom NAME] <id> <src-zone> <dst-zone> <src-cidr|@object|any> <dst-cidr|@object|any> <proto|any> <port|@service|any> <permit|deny> [nat] [app X] [url X] [ips X] [av X] [shaper X] [nolog]",
         "  policy delete <id>",
         "  save",
+        "  show ha | ha suspend | ha resume | show vpn",
+        "  show users | user-id login <ip> <user> [timeout <s>] | user-id logout <ip>",
+        "  cli-style native|fortios|panos   switch this session to a FortiOS- or PAN-OS-style CLI",
         "  quit",
     ]
     .join("\n")
@@ -248,8 +326,11 @@ fn show_policies(engine: &Engine) -> String {
             .copied()
             .unwrap_or((0, 0, 0));
         profiles.push(format!("hits={hit_packets}/{hit_bytes}B"));
-        if let Some(app) = &p.app {
-            profiles.push(format!("app={app}"));
+        if !p.apps.is_empty() {
+            profiles.push(format!("app={}", p.apps.join(",")));
+        }
+        if let Some(group) = &p.group {
+            profiles.push(format!("group={group}"));
         }
         if let Some(url) = &p.url {
             profiles.push(format!("url={url}"));
@@ -267,19 +348,35 @@ fn show_policies(engine: &Engine) -> String {
             "{:<10} {:<4} {:<13} {:<13} {:<14} {:<14} {:<6} {:<10} {:<7} {:<4} {}\n",
             p.vdom,
             p.id,
-            p.src_zone,
-            p.dst_zone,
-            p.src.to_string(),
-            p.dst.to_string(),
+            p.src_zones.join(","),
+            p.dst_zones.join(","),
+            crate::model::addr_list_text(&p.src, p.negate_src),
+            crate::model::addr_list_text(&p.dst, p.negate_dst),
             p.proto.to_string(),
-            p.service
-                .as_ref()
-                .map(|s| format!("@{s}"))
-                .or_else(|| p.dst_port.map(|v| v.to_string()))
-                .unwrap_or_else(|| "any".to_string()),
+            if p.services.is_empty() {
+                p.dst_port.map(|v| v.to_string()).unwrap_or_else(|| "any".to_string())
+            } else {
+                p.services.join(",")
+            },
             p.action.as_str(),
             if p.nat { "yes" } else { "no" },
             profiles.join(",")
+        ));
+    }
+    for d in &cfg.default_policies {
+        out.push_str(&format!(
+            "{:<10} {:<4} {:<13} {:<13} {:<14} {:<14} {:<6} {:<10} {:<7} {:<4} {}\n",
+            d.vdom,
+            "-",
+            d.src_zones.join(","),
+            d.dst_zones.join(","),
+            "any",
+            "any",
+            "any",
+            "any",
+            d.action.as_str(),
+            "no",
+            format!("default={}", d.name.clone().unwrap_or_default())
         ));
     }
     out
@@ -287,9 +384,8 @@ fn show_policies(engine: &Engine) -> String {
 
 fn show_sessions(engine: &Engine) -> String {
     let sessions = engine.sessions.lock().unwrap().snapshot();
-    let cfg = engine.cfg.read().unwrap();
     let mut out = String::from(
-        "vdom       proto  source                     destination                nat                 app        ttl   state\n",
+        "vdom       proto  source                     destination                nat                 app              ttl   state\n",
     );
     for s in sessions {
         let nat = match (s.nat_src, s.nat_dst) {
@@ -300,9 +396,9 @@ fn show_sessions(engine: &Engine) -> String {
             }
             (None, None) => "-".to_string(),
         };
-        let app = cfg.detected_app(s.key.proto, s.key.dport).unwrap_or("-");
+        let app = s.app.as_deref().unwrap_or("pending");
         out.push_str(&format!(
-            "{:<10} {:<6} {:<26} {:<26} {:<19} {:<10} {}s {}\n",
+            "{:<10} {:<6} {:<26} {:<26} {:<19} {:<16} {}s {}\n",
             s.key.vdom,
             s.key.proto,
             format!("{}:{}", s.key.src, s.key.sport),
@@ -317,6 +413,19 @@ fn show_sessions(engine: &Engine) -> String {
             } else {
                 "-"
             }
+        ));
+    }
+    for s in engine.sessions6.lock().unwrap().snapshot() {
+        out.push_str(&format!(
+            "{:<10} {:<6} {:<26} {:<26} {:<19} {:<16} {}s {}\n",
+            s.key.vdom,
+            s.key.proto,
+            format!("[{}]:{}", s.key.src, s.key.sport),
+            format!("[{}]:{}", s.key.dst, s.key.dport),
+            "-",
+            s.app.as_deref().unwrap_or("pending"),
+            s.expires.saturating_duration_since(std::time::Instant::now()).as_secs(),
+            if s.key.proto == 6 { s.tcp.as_str() } else { "-" }
         ));
     }
     out
@@ -396,15 +505,24 @@ pub fn run_client(host: &str, port: u16, command: Option<&str>) -> std::io::Resu
         }
         None => {
             let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let line = line?;
+            let mut input = stdin.lock();
+            loop {
+                stream.write_all(b"prompt\n")?;
+                print!("{}", read_response(&mut reader)?);
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                if input.read_line(&mut line)? == 0 {
+                    break;
+                }
                 if line.trim().is_empty() {
                     continue;
                 }
-                stream.write_all(format!("{line}\n").as_bytes())?;
+                stream.write_all(line.as_bytes())?;
                 let text = read_response(&mut reader)?;
-                println!("{text}");
-                if matches!(line.trim(), "quit" | "exit") {
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+                if text == "bye" {
                     break;
                 }
             }

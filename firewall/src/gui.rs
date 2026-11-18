@@ -575,6 +575,43 @@ fn route(engine: &Engine, auth: &Auth, req: &Request, tls: bool) -> Response {
         ("GET", "/api/v1/policies") => {
             Response::json(200, json!({"policies": policies_value(engine)}))
         }
+        ("GET", "/api/v1/user-id") => {
+            let cfg = engine.cfg.read().unwrap().clone();
+            let rows: Vec<Value> = engine
+                .user_mappings(&cfg)
+                .into_iter()
+                .map(|(ip, user, source, left)| json!({"ip": ip, "user": user, "source": source, "expires_in": left}))
+                .collect();
+            Response::json(200, json!({"mappings": rows}))
+        }
+        ("POST", "/api/v1/user-id/login" | "/api/v1/user-id/logout") => {
+            if !authn.session.role.can_write() {
+                return Response::error(403, "role is read-only for configuration");
+            }
+            let value: Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(_) => return Response::error(400, "body must be JSON: {\"ip\": \"a.b.c.d\", \"user\": \"name\", \"timeout\": seconds}"),
+            };
+            let Some(ip) = value["ip"].as_str().and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok()) else {
+                return Response::error(400, "ip must be an IPv4 address");
+            };
+            if req.path.ends_with("/logout") {
+                let removed = engine.user_logout(ip);
+                auth.audit(&authn.session.username, "user-id.logout", &ip.to_string());
+                return Response::json(200, json!({"ok": true, "removed": removed}));
+            }
+            let Some(user) = value["user"].as_str() else {
+                return Response::error(400, "user is required");
+            };
+            let timeout = value["timeout"].as_u64().map(std::time::Duration::from_secs);
+            match engine.user_login(ip, user, timeout) {
+                Ok(()) => {
+                    auth.audit(&authn.session.username, "user-id.login", &format!("{ip} {user}"));
+                    Response::json(200, json!({"ok": true}))
+                }
+                Err(e) => Response::error(400, &e),
+            }
+        }
         ("GET", "/api/v1/nat") => Response::json(200, json!({"rules": nat_value(engine)})),
         ("GET", "/api/v1/objects") => {
             Response::json(200, json!({"objects": objects_value(engine)}))
@@ -884,18 +921,20 @@ fn state_json(engine: &Engine) -> String {
             json!({
                 "id": p.id,
                 "vdom": p.vdom,
-                "src_zone": p.src_zone,
-                "dst_zone": p.dst_zone,
-                "src": p.src.to_string(),
-                "dst": p.dst.to_string(),
+                "src_zone": p.src_zones.join(","),
+                "dst_zone": p.dst_zones.join(","),
+                "src": crate::model::addr_list_text(&p.src, p.negate_src),
+                "dst": crate::model::addr_list_text(&p.dst, p.negate_dst),
                 "proto": p.proto.to_string(),
                 "dst_port": p.dst_port,
-                "service": p.service,
+                "service": if p.services.is_empty() { None } else { Some(p.services.join(",")) },
                 "action": p.action.as_str(),
                 "enabled": p.enabled,
                 "name": p.name,
                 "nat": p.nat,
-                "app": p.app,
+                "app": if p.apps.is_empty() { None } else { Some(p.apps.join(",")) },
+                "group": p.group,
+                "users": p.users,
                 "url": p.url,
                 "ips": p.ips,
                 "av": p.av,
@@ -970,6 +1009,8 @@ fn sessions_json(engine: &Engine, query: &HashMap<String, String>) -> String {
             "dport": session.key.dport,
             "nat": nat,
             "policy": session.policy_id,
+            "app": session.app.as_deref().unwrap_or("pending"),
+            "user": session.user,
             "shaper": session.shaper,
             "ttl": session.expires.saturating_duration_since(now).as_secs(),
         });
@@ -1120,18 +1161,20 @@ fn policies_value(engine: &Engine) -> Value {
                 json!({
                     "id": p.id,
                     "vdom": p.vdom,
-                    "src_zone": p.src_zone,
-                    "dst_zone": p.dst_zone,
-                    "src": p.src.to_string(),
-                    "dst": p.dst.to_string(),
+                    "src_zone": p.src_zones.join(","),
+                    "dst_zone": p.dst_zones.join(","),
+                    "src": crate::model::addr_list_text(&p.src, p.negate_src),
+                    "dst": crate::model::addr_list_text(&p.dst, p.negate_dst),
                     "proto": p.proto.to_string(),
                     "dst_port": p.dst_port,
-                    "service": p.service,
+                    "service": if p.services.is_empty() { None } else { Some(p.services.join(",")) },
                     "action": p.action.as_str(),
                             "enabled": p.enabled,
                             "name": p.name,
                     "nat": p.nat,
-                    "app": p.app,
+                    "app": if p.apps.is_empty() { None } else { Some(p.apps.join(",")) },
+                "group": p.group,
+                "users": p.users,
                     "url": p.url,
                     "ips": p.ips,
                     "av": p.av,
@@ -1171,7 +1214,7 @@ fn objects_value(engine: &Engine) -> Value {
             "entries": a.entries.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "address_groups": cfg.address_groups.iter().map(|g| json!({"name": g.name, "members": g.members})).collect::<Vec<_>>(),
-        "services": cfg.services.iter().map(|s| json!({"name": s.name, "proto": s.proto.to_string(), "port": s.port})).collect::<Vec<_>>(),
+        "services": cfg.services.iter().map(|s| json!({"name": s.name, "proto": s.proto.to_string(), "port": s.ports_text()})).collect::<Vec<_>>(),
         "applications": cfg.apps.iter().map(|a| json!({"name": a.name, "proto": a.proto.to_string(), "port": a.port})).collect::<Vec<_>>(),
         "url_filters": cfg.url_filters.iter().map(|u| json!({"name": u.name, "block": u.block})).collect::<Vec<_>>(),
         "shapers": cfg.shapers.iter().map(|s| json!({"name": s.name, "kbps": s.kbps})).collect::<Vec<_>>(),

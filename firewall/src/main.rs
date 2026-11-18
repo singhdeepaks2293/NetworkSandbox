@@ -1,13 +1,18 @@
+mod appid;
 mod auth;
 mod cli;
 mod dataplane;
 mod diff;
 mod gui;
+mod ha;
+mod wg;
 mod inspect;
 mod model;
 mod nft;
 mod packet;
+mod style;
 mod tls;
+mod tls_inspect;
 
 use dataplane::{Engine, Sessions, Stats};
 use model::Config;
@@ -28,8 +33,21 @@ fn main() {
         Some("nft-apply") => nft_apply(&args[1..]),
         Some("nft-remove") => nft_remove(&args[1..]),
         Some("password-reset-token") => password_reset_token(&args[1..]),
+        Some("ssl-ca-generate") => ssl_ca_generate(&args[1..]),
+        Some("wg-genkey") => {
+            println!("{}", wg::genkey());
+            Ok(())
+        }
+        Some("wg-pubkey") => {
+            let mut key = String::new();
+            std::io::stdin()
+                .read_line(&mut key)
+                .map_err(|e| e.to_string())
+                .and_then(|_| wg::pubkey(&key))
+                .map(|k| println!("{k}"))
+        }
         Some("version" | "-V" | "--version") => {
-            println!("firewall 0.1.0");
+            println!("firewall 0.2.0");
             Ok(())
         }
         Some("help" | "-h" | "--help") | None => {
@@ -46,7 +64,7 @@ fn main() {
 
 fn usage() {
     println!(
-        "firewall 0.1.0 - a tiny educational stateful IPv4 firewall\n\
+        "firewall 0.2.0 - a lightweight educational next-generation IPv4 firewall\n\
 \n\
 usage:\n\
   firewall daemon [--config PATH] [--hostname NAME] [--cli-port N] [--gui-port N]\n\
@@ -56,6 +74,8 @@ usage:\n\
   firewall nft-apply --config PATH\n\
   firewall nft-remove\n\
   firewall password-reset-token --config PATH --username NAME\n\
+  firewall wg-genkey | firewall wg-pubkey      (WireGuard keys, like wg genkey / wg pubkey)\n\
+  firewall ssl-ca-generate --out DIR [--name CN]  (TLS inspection CA: ca.crt, ca.key)\n\
 \n\
 The daemon opens AF_PACKET sockets on every configured interface, forwards\n\
 IPv4 between zones according to the first matching policy, keeps a stateful\n\
@@ -131,7 +151,7 @@ fn daemon(args: &[String]) -> Result<(), String> {
         cfg.settings.gui_port = port;
     }
 
-    println!("firewall 0.1.0");
+    println!("firewall 0.2.0");
     println!("hostname: {}", cfg.settings.hostname);
     if cfg.interfaces.is_empty() {
         println!("interfaces: none configured (control plane only)");
@@ -175,6 +195,25 @@ fn daemon(args: &[String]) -> Result<(), String> {
         Some(path.clone()),
     ));
 
+    if !engine.cfg.read().unwrap().tunnels.is_empty() {
+        let engine = engine.clone();
+        std::thread::spawn(move || loop {
+            engine.vpn_tick();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+    }
+    let ha_settings = engine.cfg.read().unwrap().ha.clone();
+    if ha_settings.enabled {
+        let agent = ha::Agent::new(engine.clone(), ha_settings.clone())
+            .map_err(|e| format!("ha: cannot bind {:?}: {e}", ha_settings.bind))?;
+        println!(
+            "ha: active-passive, priority {}, heartbeat {} -> {}",
+            ha_settings.priority,
+            ha_settings.bind.map(|b| b.to_string()).unwrap_or_default(),
+            ha_settings.peer.map(|p| p.to_string()).unwrap_or_default()
+        );
+        std::thread::spawn(move || agent.run());
+    }
     if !no_gui {
         let engine = engine.clone();
         let auth = auth.clone();
@@ -265,20 +304,51 @@ fn config_check(args: &[String]) -> Result<(), String> {
     let path = Path::new(path);
     let cfg = load_config(path)?;
     println!(
-        "ok: {} vdom(s), {} interface(s), {} policy(ies), {} default route(s)",
+        "ok: {} vdom(s), {} interface(s), {} policy(ies), {} route(s), {} IPv6 route(s), {} snat rule(s)",
         cfg.vdoms.len(),
         cfg.interfaces.len(),
         cfg.policies.len(),
-        cfg.routes.len()
+        cfg.routes.len(),
+        cfg.routes6.len(),
+        cfg.snat.len()
     );
     for route in &cfg.routes {
+        let dst = if route.dst == model::Cidr::ANY { "default".to_string() } else { route.dst.to_string() };
         println!(
-            "  {:<12} default {}{}",
+            "  {:<12} {dst} {}{} distance {}",
             route.vdom,
             route.interface,
-            route.via.map(|v| format!(" via {v}")).unwrap_or_default()
+            route.via.map(|v| format!(" via {v}")).unwrap_or_default(),
+            route.distance
         );
     }
+    Ok(())
+}
+
+/// Create the TLS inspection CA. Clients must trust ca.crt; ca.key stays 0600.
+fn ssl_ca_generate(args: &[String]) -> Result<(), String> {
+    let (mut out, mut name) = (None, "NetworkSandbox NGFW Inspection CA".to_string());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => out = Some(PathBuf::from(need(args, i + 1, "--out")?)),
+            "--name" => name = need(args, i + 1, "--name")?.to_string(),
+            other => return Err(format!("unknown option '{other}'")),
+        }
+        i += 2;
+    }
+    let dir = out.ok_or("usage: firewall ssl-ca-generate --out DIR [--name CN]")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (key_path, cert_path) = (dir.join("ca.key"), dir.join("ca.crt"));
+    if key_path.exists() {
+        return Err(format!("{} exists; refusing to overwrite a CA key", key_path.display()));
+    }
+    let (ca, key_pem) = tls_inspect::Ca::generate(&name)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut f, key_pem.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::write(&cert_path, &ca.cert_pem).map_err(|e| e.to_string())?;
+    println!("wrote {} (install on clients) and {} (mode 0600)", cert_path.display(), key_path.display());
     Ok(())
 }
 
