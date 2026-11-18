@@ -595,6 +595,8 @@ fn state_json(engine: &Engine) -> String {
                 "dst_port": p.dst_port,
                 "service": p.service,
                 "action": p.action.as_str(),
+                "enabled": p.enabled,
+                "name": p.name,
                 "nat": p.nat,
                 "app": p.app,
                 "url": p.url,
@@ -809,6 +811,8 @@ fn policies_value(engine: &Engine) -> Value {
         "dst_port": p.dst_port,
         "service": p.service,
         "action": p.action.as_str(),
+                "enabled": p.enabled,
+                "name": p.name,
         "nat": p.nat,
         "app": p.app,
         "url": p.url,
@@ -854,7 +858,7 @@ fn security_value(engine: &Engine) -> Value {
         "ips_profiles": cfg.ips_profiles.iter().map(|p| json!({"name": p.name, "patterns": p.patterns})).collect::<Vec<_>>(),
         "av_profiles": cfg.av_profiles.iter().map(|p| json!({"name": p.name, "patterns": p.patterns})).collect::<Vec<_>>(),
         "url_filters": cfg.url_filters.len(),
-        "zones": cfg.zones.iter().map(|z| json!({"name": z.name, "syn_flood": z.syn_flood, "icmp_flood": z.icmp_flood})).collect::<Vec<_>>(),
+        "zones": cfg.zones.iter().map(|z| json!({"name": z.name, "syn_flood": z.syn_flood, "icmp_flood": z.icmp_flood, "udp_flood": z.udp_flood})).collect::<Vec<_>>(),
         "tls_inspection": {"state": "not_implemented"},
         "vpn": {"state": "not_implemented"},
     })
@@ -1176,7 +1180,7 @@ function parseCfg(text){
       const p={id:w[1],vdom:cur};
       for(let i=2;i<w.length;i++){
         const t=w[i];
-        if(['permit','deny'].includes(t)) p.action=t;
+        if(['permit','deny','reject'].includes(t)) p.action=t;
         else if(t==='nat'||t==='log'||t==='nolog'){if(t==='nat')p.nat=true; if(t==='log')p.log=true;}
         else if(i%2===0){p[t]=w[i+1]||''; i++;}
       }
@@ -1185,7 +1189,7 @@ function parseCfg(text){
   }
   return o;
 }
-function chipAction(a){return a==='permit'?'<span class="chip ok">ACCEPT</span>':'<span class="chip bad">DENY</span>';}
+function chipAction(a){return a==='permit'?'<span class="chip ok">ACCEPT</span>':a==='reject'?'<span class="chip warn">REJECT</span>':'<span class="chip bad">DENY</span>';}
 function ifaceState(i){return i.address&&i.address!=='-'?'on':'off';}
 function cards(){
   const s=state.data; if(!s) return '';
@@ -1260,6 +1264,7 @@ function renderPolicies(){
 }
 function profileChips(p){
   const c=[];
+  if(p.enabled===false)c.push('Disabled'); if(p.name)c.push('Name:'+p.name);
   if(p.app)c.push('App:'+p.app); if(p.url)c.push('URL:'+p.url); if(p.ips)c.push('IPS:'+p.ips); if(p.av)c.push('AV:'+p.av); if(p.shaper)c.push('Shaper:'+p.shaper);
   return c.length?c.map(x=>`<span class="chip info">${esc(x)}</span>`).join(' '):'<span class="chip muted">none</span>';
 }

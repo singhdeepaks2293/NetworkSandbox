@@ -133,6 +133,7 @@ fn show_interfaces(engine: &Engine) -> String {
 
 fn show_policies(engine: &Engine) -> String {
     let cfg = engine.cfg.read().unwrap();
+    let hits = engine.policy_hits();
     let mut out = String::from(
         "vdom       id   source        destination   src            dst            proto  port       action  nat  profiles\n",
     );
@@ -140,6 +141,17 @@ fn show_policies(engine: &Engine) -> String {
     policies.sort_by_key(|p| p.id);
     for p in policies {
         let mut profiles = Vec::new();
+        if !p.enabled {
+            profiles.push("disabled".to_string());
+        }
+        if let Some(name) = &p.name {
+            profiles.push(format!("name={name}"));
+        }
+        let (hit_packets, hit_bytes, _) = hits
+            .get(&(p.vdom.clone(), p.id))
+            .copied()
+            .unwrap_or((0, 0, 0));
+        profiles.push(format!("hits={hit_packets}/{hit_bytes}B"));
         if let Some(app) = &p.app {
             profiles.push(format!("app={app}"));
         }
@@ -181,7 +193,7 @@ fn show_sessions(engine: &Engine) -> String {
     let sessions = engine.sessions.lock().unwrap().snapshot();
     let cfg = engine.cfg.read().unwrap();
     let mut out = String::from(
-        "vdom       proto  source                     destination                nat                 app        ttl\n",
+        "vdom       proto  source                     destination                nat                 app        ttl   state\n",
     );
     for s in sessions {
         let nat = match (s.nat_src, s.nat_dst) {
@@ -194,7 +206,7 @@ fn show_sessions(engine: &Engine) -> String {
         };
         let app = cfg.detected_app(s.key.proto, s.key.dport).unwrap_or("-");
         out.push_str(&format!(
-            "{:<10} {:<6} {:<26} {:<26} {:<19} {:<10} {}s\n",
+            "{:<10} {:<6} {:<26} {:<26} {:<19} {:<10} {}s {}\n",
             s.key.vdom,
             s.key.proto,
             format!("{}:{}", s.key.src, s.key.sport),
@@ -203,7 +215,12 @@ fn show_sessions(engine: &Engine) -> String {
             app,
             s.expires
                 .saturating_duration_since(std::time::Instant::now())
-                .as_secs()
+                .as_secs(),
+            if s.key.proto == 6 {
+                s.tcp.as_str()
+            } else {
+                "-"
+            }
         ));
     }
     out

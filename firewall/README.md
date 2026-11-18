@@ -23,6 +23,21 @@ compatible replacement for any commercial firewall product.
 - Per-zone SYN and ICMP flood limits.
 - Text or JSON flow logging, GUI session/policy views, config validation.
 - ARP resolution, TTL decrement and checksum rewriting.
+- TCP state tracking (SYN_SENT, SYN_RECV, ESTABLISHED, CLOSING, TIME_WAIT,
+  CLOSED) with per-state timeouts. Only a clean SYN opens a TCP flow; stray
+  ACKs, packets after RST and SYNs inside an established flow are dropped.
+- Return traffic is inspected with the same URL/IPS/AV profile as the
+  forward direction. A flow whose policy is deleted, disabled or changed to
+  deny is cut off.
+- Ingress sanity drops: fragments, martian source/destination, LAND, and
+  invalid TCP flag combinations.
+- ICMP Time Exceeded (traceroute works through the firewall) and Network
+  Unreachable on no route, rate limited per zone.
+- Policy actions `permit`, `deny` and `reject` (TCP RST or ICMP unreachable);
+  `disable` and `name <word>` options; per-policy hit counters in
+  `show policies`.
+- Connection-table protection: `system max-sessions`, `system
+  max-sessions-per-ip`; `zone <z> udp-flood <pps>` limits new UDP flows.
 
 ## Build
 
@@ -46,7 +61,8 @@ sudo ./target/release/firewall daemon --config examples/default.conf
 ```
 
 The daemon needs `CAP_NET_RAW`/root to open AF_PACKET sockets. The CLI and GUI
-listen on TCP ports 2200 and 8080 by default; both are unauthenticated.
+listen on TCP ports 2200 and 8080 by default. The CLI is unauthenticated; the
+GUI requires a login.
 
 ```sh
 ./target/release/firewall cli --port 2200 -c "show policies"
@@ -114,12 +130,15 @@ through the chain, DNAT, URL blocking/allowing and an inserted deny policy.
 
 ## Limitations
 
-- IPv4 only; no IPv6, VLAN tags, fragmentation handling or ALG.
+- IPv4 only; no IPv6, VLAN tags or ALG. Fragments are dropped, not reassembled.
+- TCP tracking does not check sequence numbers, so a spoofed RST for a known
+  5-tuple still closes a flow.
 - HTTP/TLS and signature inspection see one packet at a time, so requests
   split across TCP segments may not match.
 - Signature profiles are literal substring matches, not real IPS/AV engines.
-- The GUI and CLI have no authentication; expose them only on a trusted
-  management network.
+- The CLI has no authentication. The GUI requires a login and supports
+  admin/operator/auditor RBAC; still expose both only on a trusted management
+  network.
 - ARP misses drop the first packet rather than queueing it.
 - No high-availability, routing protocols, VPN or user identity.
 - VDOMs isolate forwarding configuration, not administrative access; the GUI

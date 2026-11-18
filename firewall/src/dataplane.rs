@@ -3,10 +3,11 @@
 
 use crate::model::{Action, Cidr, Config, Interface};
 use crate::packet::{
-    build_arp, ethertype, icmp_identity, parse_arp, read_mac, write_mac, Ipv4, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETH_HEADER_LEN, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
+    build_arp, build_icmp_error, build_tcp_rst, ethertype, icmp_identity, parse_arp, read_mac,
+    read_u32, write_mac, Ipv4, ETHERTYPE_ARP, ETHERTYPE_IPV4, ETH_HEADER_LEN, PROTO_ICMP,
+    PROTO_TCP, PROTO_UDP,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
@@ -38,9 +39,118 @@ impl fmt::Display for SessionKey {
     }
 }
 
+/// Connection state of a tracked TCP flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpState {
+    SynSent,
+    SynRecv,
+    Established,
+    Closing,
+    TimeWait,
+    Closed,
+}
+
+impl TcpState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TcpState::SynSent => "SYN_SENT",
+            TcpState::SynRecv => "SYN_RECV",
+            TcpState::Established => "ESTABLISHED",
+            TcpState::Closing => "CLOSING",
+            TcpState::TimeWait => "TIME_WAIT",
+            TcpState::Closed => "CLOSED",
+        }
+    }
+}
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_ACK: u8 = 0x10;
+
+/// Reject TCP flag combinations that no sane stack sends (null scan,
+/// SYN+FIN, SYN+RST, FIN+RST).
+pub fn tcp_flags_sane(flags: u8) -> bool {
+    let syn = flags & TCP_SYN != 0;
+    let fin = flags & TCP_FIN != 0;
+    let rst = flags & TCP_RST != 0;
+    flags & (TCP_FIN | TCP_SYN | TCP_RST | TCP_ACK) != 0 && !(syn && fin) && !(syn && rst) && !(fin && rst)
+}
+
+/// Advance the TCP state machine for one packet. `from_orig` is true for the
+/// direction that opened the flow. Returns false when the packet is not valid
+/// in the current state; the caller must drop it. Sequence numbers are not
+/// tracked, so in-window checks are not performed.
+pub fn tcp_track(s: &mut Session, from_orig: bool, flags: u8) -> bool {
+    if flags & TCP_RST != 0 {
+        s.tcp = TcpState::Closed;
+        return true;
+    }
+    let syn = flags & TCP_SYN != 0;
+    let ack = flags & TCP_ACK != 0;
+    match s.tcp {
+        TcpState::SynSent => {
+            if from_orig {
+                syn && !ack
+            } else if syn && ack {
+                s.tcp = TcpState::SynRecv;
+                true
+            } else {
+                false
+            }
+        }
+        TcpState::SynRecv => {
+            if from_orig {
+                if syn && !ack {
+                    true
+                } else if !syn && ack {
+                    s.tcp = TcpState::Established;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                syn && ack
+            }
+        }
+        TcpState::Established | TcpState::Closing => {
+            if syn {
+                return false;
+            }
+            if flags & TCP_FIN != 0 {
+                if from_orig {
+                    s.fin_orig = true;
+                } else {
+                    s.fin_reply = true;
+                }
+                s.tcp = if s.fin_orig && s.fin_reply {
+                    TcpState::TimeWait
+                } else {
+                    TcpState::Closing
+                };
+            }
+            true
+        }
+        TcpState::TimeWait | TcpState::Closed => {
+            if from_orig && syn && !ack {
+                // Port reuse: a fresh SYN from the original side re-opens the flow.
+                s.tcp = TcpState::SynSent;
+                s.fin_orig = false;
+                s.fin_reply = false;
+                true
+            } else {
+                s.tcp != TcpState::Closed && !syn
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub key: SessionKey,
+    pub tcp: TcpState,
+    pub fin_orig: bool,
+    pub fin_reply: bool,
     pub in_index: i32,
     pub out_index: i32,
     pub nat_src: Option<(Ipv4Addr, u16)>,
@@ -54,6 +164,11 @@ pub struct Session {
 pub struct Sessions {
     forward: HashMap<SessionKey, Session>,
     reverse: HashMap<SessionKey, SessionKey>,
+    /// (proto, nat ip, nat port, peer ip, peer port) in use, for O(1) PAT
+    /// port allocation.
+    nat_ports: HashSet<(u8, Ipv4Addr, u16, Ipv4Addr, u16)>,
+    /// Number of tracked flows per original source address.
+    per_src: HashMap<Ipv4Addr, usize>,
 }
 
 impl Sessions {
@@ -62,17 +177,96 @@ impl Sessions {
     }
 
     pub fn lookup(&self, key: SessionKey) -> Option<Session> {
+        let now = Instant::now();
         if let Some(session) = self.forward.get(&key) {
-            return Some(session.clone());
+            return if session.expires > now {
+                Some(session.clone())
+            } else {
+                None
+            };
         }
         let forward_key = self.reverse.get(&key)?;
-        self.forward.get(forward_key).cloned()
+        self.forward
+            .get(forward_key)
+            .filter(|s| s.expires > now)
+            .cloned()
     }
 
     pub fn insert(&mut self, session: Session) {
+        if let Some(old) = self.forward.remove(&session.key) {
+            self.forget(&old);
+        }
+        if let Some((ip, port)) = session.nat_src {
+            self.nat_ports.insert((
+                session.key.proto,
+                ip,
+                port,
+                session.key.dst,
+                session.key.dport,
+            ));
+        }
+        *self.per_src.entry(session.key.src).or_insert(0) += 1;
         self.reverse
             .insert(reverse_key(&session), session.key.clone());
         self.forward.insert(session.key.clone(), session);
+    }
+
+    /// Number of tracked flows opened by `src`.
+    pub fn count_for_src(&self, src: Ipv4Addr) -> usize {
+        self.per_src.get(&src).copied().unwrap_or(0)
+    }
+
+    /// Run the TCP state machine for the flow whose forward key is `key` and
+    /// refresh its timeout according to the new state. Returns false when the
+    /// packet is invalid for the state (or the flow no longer exists).
+    pub fn track_tcp(
+        &mut self,
+        key: &SessionKey,
+        from_orig: bool,
+        flags: u8,
+        established_timeout: u64,
+    ) -> bool {
+        let Some(s) = self.forward.get_mut(key) else {
+            return false;
+        };
+        if !tcp_track(s, from_orig, flags) {
+            return false;
+        }
+        let secs = match s.tcp {
+            TcpState::SynSent | TcpState::SynRecv => established_timeout.min(60),
+            TcpState::Established => established_timeout,
+            TcpState::Closing => established_timeout.min(120),
+            TcpState::TimeWait => established_timeout.min(30),
+            TcpState::Closed => established_timeout.min(10),
+        };
+        s.expires = Instant::now() + Duration::from_secs(secs);
+        true
+    }
+
+    /// Refresh the idle timeout of a non-TCP flow.
+    pub fn touch(&mut self, key: &SessionKey, secs: u64) {
+        if let Some(s) = self.forward.get_mut(key) {
+            s.expires = Instant::now() + Duration::from_secs(secs);
+        }
+    }
+
+    fn forget(&mut self, session: &Session) {
+        self.reverse.remove(&reverse_key(session));
+        if let Some((ip, port)) = session.nat_src {
+            self.nat_ports.remove(&(
+                session.key.proto,
+                ip,
+                port,
+                session.key.dst,
+                session.key.dport,
+            ));
+        }
+        if let Some(n) = self.per_src.get_mut(&session.key.src) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_src.remove(&session.key.src);
+            }
+        }
     }
 
     pub fn entries(&self) -> Vec<Session> {
@@ -90,7 +284,7 @@ impl Sessions {
             .collect();
         for key in expired {
             if let Some(session) = self.forward.remove(&key) {
-                self.reverse.remove(&reverse_key(&session));
+                self.forget(&session);
             }
         }
     }
@@ -109,12 +303,7 @@ impl Sessions {
         dst: Ipv4Addr,
         dport: u16,
     ) -> bool {
-        self.forward.values().any(|s| {
-            matches!(s.nat_src, Some((ip, p)) if ip == nat_ip && p == port)
-                && s.key.proto == proto
-                && s.key.dst == dst
-                && s.key.dport == dport
-        })
+        self.nat_ports.contains(&(proto, nat_ip, port, dst, dport))
     }
 }
 
@@ -172,6 +361,9 @@ pub struct Engine {
     flood: Mutex<HashMap<String, FloodCounter>>,
     shapers: Mutex<HashMap<String, ShaperBucket>>,
     pub logs: Mutex<VecDeque<String>>,
+    /// Per-policy counters keyed by (vdom, policy id): packets, bytes, last
+    /// hit as unix seconds.
+    pub hits: Mutex<HashMap<(String, u32), (u64, u64, u64)>>,
     /// Staged configuration text; it is not enforced until commit.
     pub candidate: Mutex<Option<String>>,
     /// Previous running configuration texts, oldest first.
@@ -264,10 +456,106 @@ impl Engine {
             flood: Mutex::new(HashMap::new()),
             shapers: Mutex::new(HashMap::new()),
             logs: Mutex::new(VecDeque::new()),
+            hits: Mutex::new(HashMap::new()),
             candidate: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             revisions: Mutex::new(1),
         }
+    }
+
+    /// Count a packet against a policy.
+    fn bump_hit(&self, vdom: &str, policy: u32, bytes: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut hits = self.hits.lock().unwrap();
+        let entry = hits.entry((vdom.to_string(), policy)).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += bytes;
+        entry.2 = now;
+    }
+
+    /// Snapshot of per-policy counters: (vdom, id) -> (packets, bytes, last hit).
+    pub fn policy_hits(&self) -> HashMap<(String, u32), (u64, u64, u64)> {
+        self.hits.lock().unwrap().clone()
+    }
+
+    /// Send an ICMP error about `orig` (an IP header plus at least eight
+    /// bytes of payload) back to its sender, rate limited per ingress zone.
+    /// ICMP errors are never sent about ICMP errors or to non-unicast sources.
+    fn send_icmp_error(&self, slot: usize, src_mac: [u8; 6], orig: &[u8], icmp_type: u8, code: u8) {
+        if orig.len() < 28 {
+            return;
+        }
+        let hlen = (orig[0] & 0x0f) as usize * 4;
+        if hlen < 20 || orig.len() < hlen + 8 {
+            return;
+        }
+        if orig[9] == PROTO_ICMP && matches!(orig[hlen], 3 | 4 | 5 | 11 | 12) {
+            return;
+        }
+        let dst_ip = Ipv4Addr::new(orig[12], orig[13], orig[14], orig[15]);
+        if dst_ip.is_multicast() || dst_ip.is_broadcast() || dst_ip.is_unspecified() {
+            return;
+        }
+        let Some(out) = self.ifaces.get(slot) else {
+            return;
+        };
+        let Some(cidr) = out.address else {
+            return;
+        };
+        if self.flood_exceeded(&out.zone, "icmp-error", 100) {
+            return;
+        }
+        let frame = build_icmp_error(src_mac, out.mac, cidr.addr, dst_ip, icmp_type, code, orig);
+        self.send(slot, &frame);
+    }
+
+    /// Answer a refused TCP segment with a RST that appears to come from the
+    /// intended destination (`peer_ip`:`peer_port`).
+    fn send_tcp_rst(
+        &self,
+        slot: usize,
+        src_mac: [u8; 6],
+        ip: &Ipv4<'_>,
+        peer_ip: Ipv4Addr,
+        peer_port: u16,
+    ) {
+        let Some(out) = self.ifaces.get(slot) else {
+            return;
+        };
+        let t = ip.transport();
+        if t.len() < 20 {
+            return;
+        }
+        let flags = t[13];
+        if flags & TCP_RST != 0 {
+            return;
+        }
+        if self.flood_exceeded(&out.zone, "reject", 200) {
+            return;
+        }
+        let seq = read_u32(t, 4);
+        let ack = read_u32(t, 8);
+        let data_off = ((t[12] >> 4) as usize) * 4;
+        let mut seg_len = t.len().saturating_sub(data_off) as u32;
+        if flags & TCP_SYN != 0 {
+            seg_len += 1;
+        }
+        if flags & TCP_FIN != 0 {
+            seg_len += 1;
+        }
+        let (rseq, rack, with_ack) = if flags & TCP_ACK != 0 {
+            (ack, 0, false)
+        } else {
+            (0, seq.wrapping_add(seg_len), true)
+        };
+        let (sport, _) = ip.ports().unwrap_or((0, 0));
+        let frame = build_tcp_rst(
+            src_mac, out.mac, peer_ip, ip.src(), peer_port, sport, rseq, rack, with_ack,
+        );
+        self.send(slot, &frame);
     }
 
     fn flood_exceeded(&self, zone: &str, kind: &str, limit: u32) -> bool {
@@ -679,10 +967,20 @@ impl Engine {
         let src = ip.src();
         let original_dst = ip.dst();
 
-        let cfg = self.cfg.read().unwrap().clone();
+        // Hold the read lock for this packet instead of cloning the whole
+        // configuration. Nothing below takes the config lock again.
+        let cfg_guard = self.cfg.read().unwrap();
+        let cfg: &Config = &cfg_guard;
         let in_iface = &self.ifaces[slot];
         let local = self.local_ip(&in_iface.vdom, original_dst);
         let proto = ip.protocol();
+        // Quote of the packet as received, used for ICMP errors about a TTL
+        // that is about to expire (before any NAT rewrites the header).
+        let ttl_quote: Option<Vec<u8>> = if !local && ip.ttl() <= 1 {
+            Some(ip.data[..(ip.header_len() + 8).min(ip.total_len())].to_vec())
+        } else {
+            None
+        };
         let (sport, dport) = match proto {
             PROTO_TCP | PROTO_UDP => ip.ports().unwrap_or((0, 0)),
             PROTO_ICMP => {
@@ -692,6 +990,51 @@ impl Engine {
             _ => (0, 0),
         };
         let vdom = in_iface.vdom.clone();
+
+        // Ingress sanity: drop packets that no legitimate sender produces.
+        let bad: Option<&str> = if ip.is_fragment() {
+            Some("fragment (reassembly not supported)")
+        } else if src.is_unspecified()
+            || src.is_loopback()
+            || src.is_multicast()
+            || src.is_broadcast()
+        {
+            Some("martian-source")
+        } else if original_dst.is_loopback()
+            || original_dst.is_multicast()
+            || original_dst.is_broadcast()
+            || original_dst.is_unspecified()
+        {
+            Some("martian-destination")
+        } else if src == original_dst {
+            Some("land-attack")
+        } else if proto == PROTO_TCP && !ip.tcp_flags().map(tcp_flags_sane).unwrap_or(false) {
+            Some("invalid-tcp-flags")
+        } else {
+            None
+        };
+        if let Some(reason) = bad {
+            // Multicast/broadcast chatter is dropped without a log line.
+            if reason != "martian-destination" {
+                self.log_event(
+                    cfg,
+                    "deny",
+                    src,
+                    sport,
+                    original_dst,
+                    dport,
+                    proto,
+                    &in_iface.zone,
+                    "",
+                    None,
+                    reason,
+                );
+            }
+            self.stats.lock().unwrap().denied += 1;
+            self.stats_bump(slot, |s| s.dropped += 1);
+            return;
+        }
+
         let key = SessionKey {
             vdom: vdom.clone(),
             proto,
@@ -710,14 +1053,62 @@ impl Engine {
                 // Forward direction of an existing flow. Re-apply both NAT
                 // translations because each packet arrives unmodified.
                 out_slot = self.slot_for_index(s.out_index).unwrap_or(slot);
-                if let Some(policy) = cfg
+                let policy_now = cfg
                     .policies
                     .iter()
-                    .find(|p| p.id == s.policy_id && p.vdom == s.key.vdom)
-                {
-                    if let Some(reason) = security_drop(&cfg, policy, &ip, dport) {
+                    .find(|p| p.id == s.policy_id && p.vdom == s.key.vdom);
+                // A flow whose policy was deleted, disabled or turned into a
+                // deny is cut off instead of living on until it times out.
+                let Some(policy) =
+                    policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                else {
+                    self.sessions.lock().unwrap().touch(&s.key, 0);
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        ip.dst(),
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        "",
+                        Some(s.policy_id),
+                        "policy-withdrawn",
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |st| st.dropped += 1);
+                    return;
+                };
+                if let Some(reason) = security_drop(cfg, policy, &ip, dport) {
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        ip.dst(),
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        "",
+                        Some(policy.id),
+                        &reason,
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |st| st.dropped += 1);
+                    return;
+                }
+                if proto == PROTO_TCP {
+                    let flags = ip.tcp_flags().unwrap_or(0);
+                    let ok = self.sessions.lock().unwrap().track_tcp(
+                        &s.key,
+                        true,
+                        flags,
+                        cfg.settings.tcp_timeout,
+                    );
+                    if !ok {
                         self.log_event(
-                            &cfg,
+                            cfg,
                             "deny",
                             src,
                             sport,
@@ -727,7 +1118,7 @@ impl Engine {
                             &in_iface.zone,
                             "",
                             Some(policy.id),
-                            &reason,
+                            "invalid tcp state",
                         );
                         self.stats.lock().unwrap().denied += 1;
                         self.stats_bump(slot, |st| st.dropped += 1);
@@ -751,8 +1142,79 @@ impl Engine {
                     translated = true;
                 }
             } else {
-                // Reply direction: undo DNAT/SNAT back to the original flow.
+                // Reply direction: inspect, track, then undo DNAT/SNAT back to
+                // the original flow.
                 out_slot = self.slot_for_index(s.in_index).unwrap_or(slot);
+                let policy_now = cfg
+                    .policies
+                    .iter()
+                    .find(|p| p.id == s.policy_id && p.vdom == s.key.vdom);
+                let Some(policy) =
+                    policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                else {
+                    self.sessions.lock().unwrap().touch(&s.key, 0);
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        original_dst,
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        "",
+                        Some(s.policy_id),
+                        "policy-withdrawn",
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |st| st.dropped += 1);
+                    return;
+                };
+                if let Some(reason) = security_drop(cfg, policy, &ip, dport) {
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        original_dst,
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        "",
+                        Some(policy.id),
+                        &format!("reply {reason}"),
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |st| st.dropped += 1);
+                    return;
+                }
+                if proto == PROTO_TCP {
+                    let flags = ip.tcp_flags().unwrap_or(0);
+                    let ok = self.sessions.lock().unwrap().track_tcp(
+                        &s.key,
+                        false,
+                        flags,
+                        cfg.settings.tcp_timeout,
+                    );
+                    if !ok {
+                        self.log_event(
+                            cfg,
+                            "deny",
+                            src,
+                            sport,
+                            original_dst,
+                            dport,
+                            proto,
+                            &in_iface.zone,
+                            "",
+                            Some(policy.id),
+                            "invalid tcp state",
+                        );
+                        self.stats.lock().unwrap().denied += 1;
+                        self.stats_bump(slot, |st| st.dropped += 1);
+                        return;
+                    }
+                }
                 ip.set_dst(s.key.src);
                 ip.set_src(s.key.dst);
                 if proto == PROTO_TCP || proto == PROTO_UDP {
@@ -762,6 +1224,32 @@ impl Engine {
                 translated = s.nat_src.is_some() || s.nat_dst.is_some();
             }
         } else {
+            // Only a clean SYN may open a TCP flow. Anything else without a
+            // session is INVALID (stray ACK, late RST, scan probe) and is dropped.
+            if proto == PROTO_TCP {
+                let flags = ip.tcp_flags().unwrap_or(0);
+                if flags & (TCP_SYN | TCP_ACK | TCP_RST | TCP_FIN) != TCP_SYN {
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        original_dst,
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        "",
+                        None,
+                        "invalid: no session and not a SYN",
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |s| s.dropped += 1);
+                    return;
+                }
+            }
+            // Header as received, for ICMP errors/rejects (DNAT rewrites it).
+            let pre_nat: Vec<u8> = ip.data[..(ip.header_len() + 8).min(ip.total_len())].to_vec();
+
             // Destination NAT is evaluated before the local delivery check so
             // port forwards addressed to a firewall address are translated.
             let mut nat_dst = None;
@@ -797,6 +1285,7 @@ impl Engine {
                     None,
                     "no-route",
                 );
+                self.send_icmp_error(slot, src_mac, &pre_nat, 3, 0);
                 self.stats.lock().unwrap().denied += 1;
                 self.stats_bump(slot, |s| s.dropped += 1);
                 return;
@@ -814,6 +1303,9 @@ impl Engine {
                 } else if proto == PROTO_ICMP && ip.icmp_type() == Some(8) {
                     zone.icmp_flood
                         .map(|limit| ("icmp", self.flood_exceeded(&zone.name, "icmp", limit)))
+                } else if proto == PROTO_UDP {
+                    zone.udp_flood
+                        .map(|limit| ("udp", self.flood_exceeded(&zone.name, "udp", limit)))
                 } else {
                     None
                 };
@@ -857,7 +1349,16 @@ impl Engine {
                 self.stats_bump(slot, |s| s.dropped += 1);
                 return;
             };
-            if policy.action == Action::Deny {
+            if policy.action != Action::Permit {
+                self.bump_hit(&vdom, policy.id, ip.total_len() as u64);
+                if policy.action == Action::Reject {
+                    match proto {
+                        PROTO_TCP => self.send_tcp_rst(slot, src_mac, &ip, original_dst, dport),
+                        PROTO_UDP => self.send_icmp_error(slot, src_mac, &pre_nat, 3, 3),
+                        PROTO_ICMP => self.send_icmp_error(slot, src_mac, &pre_nat, 3, 13),
+                        _ => {}
+                    }
+                }
                 self.log_event(
                     &cfg,
                     "deny",
@@ -894,6 +1395,38 @@ impl Engine {
                 return;
             }
 
+            // Connection-table protection: global and per-source limits.
+            {
+                let sessions = self.sessions.lock().unwrap();
+                let max = cfg.settings.max_sessions;
+                let per_ip = cfg.settings.max_sessions_per_ip;
+                let full = max > 0 && sessions.len() >= max;
+                let source_full = per_ip > 0 && sessions.count_for_src(src) >= per_ip;
+                drop(sessions);
+                if full || source_full {
+                    self.log_event(
+                        cfg,
+                        "deny",
+                        src,
+                        sport,
+                        dst,
+                        dport,
+                        proto,
+                        &in_iface.zone,
+                        &egress.zone,
+                        Some(policy.id),
+                        if full {
+                            "session-table-full"
+                        } else {
+                            "per-source-session-limit"
+                        },
+                    );
+                    self.stats.lock().unwrap().denied += 1;
+                    self.stats_bump(slot, |s| s.dropped += 1);
+                    return;
+                }
+            }
+
             let mut nat_src = None;
             if policy.nat && nat_dst.is_none() {
                 if let Some(cidr) = egress.address {
@@ -905,10 +1438,21 @@ impl Engine {
                     nat_src = Some((cidr.addr, nat_port));
                 }
             }
-            let timeout = timeout_for(proto, &cfg);
+            let timeout = if proto == PROTO_TCP {
+                cfg.settings.tcp_timeout.min(60)
+            } else {
+                timeout_for(proto, cfg)
+            };
             let now = Instant::now();
             session = Some(Session {
                 key: key.clone(),
+                tcp: if proto == PROTO_TCP {
+                    TcpState::SynSent
+                } else {
+                    TcpState::Established
+                },
+                fin_orig: false,
+                fin_reply: false,
                 in_index: in_iface.index,
                 out_index: self.ifaces[slot_out].index,
                 nat_src,
@@ -943,13 +1487,12 @@ impl Engine {
             }
         }
 
-        if let Some(s) = &session {
-            if s.expires > Instant::now() {
-                // Refresh the timeout on activity.
-                let t = timeout_for(proto, &cfg);
-                if let Some(fwd) = self.sessions.lock().unwrap().forward.get_mut(&s.key) {
-                    fwd.expires = Instant::now() + Duration::from_secs(t);
-                }
+        if proto != PROTO_TCP {
+            if let Some(s) = &session {
+                // Refresh the idle timeout on activity. TCP flows are
+                // refreshed by the state machine instead.
+                let t = timeout_for(proto, cfg);
+                self.sessions.lock().unwrap().touch(&s.key, t);
             }
         }
         let Some(out) = self.ifaces.get(out_slot) else {
@@ -961,10 +1504,16 @@ impl Engine {
             return;
         }
         if ip.ttl() <= 1 {
+            if let Some(quote) = &ttl_quote {
+                self.send_icmp_error(slot, src_mac, quote, 11, 0);
+            }
             self.stats_bump(slot, |s| s.dropped += 1);
             return;
         }
         let total = ip.total_len();
+        if let Some(s) = &session {
+            self.bump_hit(&vdom, s.policy_id, total as u64);
+        }
         if let Some(s) = &session {
             if s.key == key {
                 if let Some(name) = &s.shaper {
@@ -1215,4 +1764,178 @@ fn open_socket(ifindex: i32) -> std::io::Result<RawFd> {
         return Err(err);
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SYN: u8 = 0x02;
+    const ACK: u8 = 0x10;
+    const FIN: u8 = 0x01;
+    const RST: u8 = 0x04;
+
+    fn key(sport: u16) -> SessionKey {
+        SessionKey {
+            vdom: "root".to_string(),
+            proto: PROTO_TCP,
+            src: "10.0.0.2".parse().unwrap(),
+            sport,
+            dst: "192.0.2.10".parse().unwrap(),
+            dport: 80,
+        }
+    }
+
+    fn session(sport: u16) -> Session {
+        Session {
+            key: key(sport),
+            tcp: TcpState::SynSent,
+            fin_orig: false,
+            fin_reply: false,
+            in_index: 1,
+            out_index: 2,
+            nat_src: None,
+            nat_dst: None,
+            policy_id: 10,
+            shaper: None,
+            expires: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn handshake_reaches_established() {
+        let mut s = session(1000);
+        assert!(tcp_track(&mut s, true, SYN));
+        assert!(tcp_track(&mut s, false, SYN | ACK));
+        assert_eq!(s.tcp, TcpState::SynRecv);
+        assert!(tcp_track(&mut s, true, ACK));
+        assert_eq!(s.tcp, TcpState::Established);
+        assert!(tcp_track(&mut s, true, ACK));
+        assert!(tcp_track(&mut s, false, ACK));
+    }
+
+    #[test]
+    fn ack_before_handshake_is_invalid() {
+        let mut s = session(1001);
+        assert!(!tcp_track(&mut s, true, ACK));
+        assert!(!tcp_track(&mut s, false, ACK));
+        assert_eq!(s.tcp, TcpState::SynSent);
+    }
+
+    #[test]
+    fn syn_inside_established_flow_is_invalid() {
+        let mut s = session(1002);
+        s.tcp = TcpState::Established;
+        assert!(!tcp_track(&mut s, true, SYN));
+        assert!(!tcp_track(&mut s, false, SYN | ACK));
+    }
+
+    #[test]
+    fn both_fins_reach_time_wait() {
+        let mut s = session(1003);
+        s.tcp = TcpState::Established;
+        assert!(tcp_track(&mut s, true, FIN | ACK));
+        assert_eq!(s.tcp, TcpState::Closing);
+        assert!(tcp_track(&mut s, false, ACK));
+        assert!(tcp_track(&mut s, false, FIN | ACK));
+        assert_eq!(s.tcp, TcpState::TimeWait);
+        assert!(tcp_track(&mut s, true, ACK));
+    }
+
+    #[test]
+    fn rst_closes_and_blocks_further_traffic() {
+        let mut s = session(1004);
+        s.tcp = TcpState::Established;
+        assert!(tcp_track(&mut s, false, RST | ACK));
+        assert_eq!(s.tcp, TcpState::Closed);
+        assert!(!tcp_track(&mut s, true, ACK));
+    }
+
+    #[test]
+    fn new_syn_reopens_closed_or_time_wait_flow() {
+        let mut s = session(1005);
+        s.tcp = TcpState::TimeWait;
+        s.fin_orig = true;
+        s.fin_reply = true;
+        assert!(tcp_track(&mut s, true, SYN));
+        assert_eq!(s.tcp, TcpState::SynSent);
+        assert!(!s.fin_orig && !s.fin_reply);
+        s.tcp = TcpState::Closed;
+        assert!(!tcp_track(&mut s, false, SYN | ACK));
+        assert!(tcp_track(&mut s, true, SYN));
+    }
+
+    #[test]
+    fn flag_sanity_rejects_scan_patterns() {
+        assert!(tcp_flags_sane(SYN));
+        assert!(tcp_flags_sane(SYN | ACK));
+        assert!(tcp_flags_sane(FIN | ACK));
+        assert!(tcp_flags_sane(RST));
+        assert!(!tcp_flags_sane(0));
+        assert!(!tcp_flags_sane(SYN | FIN));
+        assert!(!tcp_flags_sane(SYN | RST));
+        assert!(!tcp_flags_sane(FIN | RST));
+    }
+
+    #[test]
+    fn session_indexes_follow_insert_and_purge() {
+        let mut table = Sessions::default();
+        let mut a = session(2000);
+        a.nat_src = Some(("203.0.113.2".parse().unwrap(), 20001));
+        let src = a.key.src;
+        table.insert(a.clone());
+        table.insert(session(2001));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.count_for_src(src), 2);
+        assert!(table.port_in_use(
+            PROTO_TCP,
+            "203.0.113.2".parse().unwrap(),
+            20001,
+            a.key.dst,
+            a.key.dport
+        ));
+        // Re-inserting the same key replaces it without double counting.
+        table.insert(a.clone());
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.count_for_src(src), 2);
+        table.touch(&a.key, 0);
+        table.purge(Instant::now() + Duration::from_millis(1));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.count_for_src(src), 1);
+        assert!(!table.port_in_use(
+            PROTO_TCP,
+            "203.0.113.2".parse().unwrap(),
+            20001,
+            a.key.dst,
+            a.key.dport
+        ));
+    }
+
+    #[test]
+    fn expired_sessions_are_not_found() {
+        let mut table = Sessions::default();
+        let s = session(3000);
+        table.insert(s.clone());
+        assert!(table.lookup(s.key.clone()).is_some());
+        table.touch(&s.key, 0);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(table.lookup(s.key.clone()).is_none());
+    }
+
+    #[test]
+    fn track_tcp_applies_state_timeouts() {
+        let mut table = Sessions::default();
+        let s = session(4000);
+        let k = s.key.clone();
+        table.insert(s);
+        assert!(table.track_tcp(&k, true, SYN, 300));
+        assert!(table.track_tcp(&k, false, SYN | ACK, 300));
+        assert!(table.track_tcp(&k, true, ACK, 300));
+        let est = table.lookup(k.clone()).unwrap();
+        assert_eq!(est.tcp, TcpState::Established);
+        assert!(est.expires > Instant::now() + Duration::from_secs(200));
+        assert!(table.track_tcp(&k, false, RST, 300));
+        let closed = table.lookup(k).unwrap();
+        assert!(closed.expires <= Instant::now() + Duration::from_secs(11));
+    }
 }

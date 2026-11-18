@@ -179,6 +179,23 @@ impl<'a> Ipv4<'a> {
         t.len() >= 14 && t[13] & 0x02 != 0 && t[13] & 0x10 == 0
     }
 
+    /// TCP flag byte (FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10).
+    pub fn tcp_flags(&self) -> Option<u8> {
+        if self.protocol() != PROTO_TCP {
+            return None;
+        }
+        let t = self.transport();
+        if t.len() < 14 {
+            return None;
+        }
+        Some(t[13])
+    }
+
+    /// True for the first or any later fragment of a fragmented datagram.
+    pub fn is_fragment(&self) -> bool {
+        read_u16(self.data, 6) & 0x3fff != 0
+    }
+
     pub fn icmp_type(&self) -> Option<u8> {
         if self.protocol() != PROTO_ICMP {
             return None;
@@ -254,6 +271,91 @@ impl<'a> Ipv4<'a> {
         write_u16(self.data, hlen + 2, fold_checksum(sum));
         true
     }
+}
+
+/// Wrap an IPv4 packet (header already filled in, checksums not yet set) in an
+/// Ethernet frame and fix the IP header checksum.
+fn finish_frame(dst_mac: [u8; 6], src_mac: [u8; 6], ip_packet: Vec<u8>) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(ETH_HEADER_LEN + ip_packet.len());
+    frame.extend_from_slice(&[0u8; ETH_HEADER_LEN]);
+    frame.extend_from_slice(&ip_packet);
+    write_mac(&mut frame, 0, dst_mac);
+    write_mac(&mut frame, 6, src_mac);
+    write_u16(&mut frame, 12, ETHERTYPE_IPV4);
+    if let Some(mut ip) = Ipv4::parse(&mut frame[ETH_HEADER_LEN..]) {
+        ip.recompute_header_checksum();
+    }
+    frame
+}
+
+fn ipv4_header(total: usize, proto: u8, src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+    let mut h = vec![0u8; 20];
+    h[0] = 0x45;
+    write_u16(&mut h, 2, total as u16);
+    h[8] = 64;
+    h[9] = proto;
+    h[12..16].copy_from_slice(&src.octets());
+    h[16..20].copy_from_slice(&dst.octets());
+    h
+}
+
+/// Build an ICMP error (time exceeded, destination unreachable, ...) that
+/// quotes the offending packet's IP header plus its first eight bytes.
+/// `original` is the offending IP packet starting at its IP header.
+pub fn build_icmp_error(
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    icmp_type: u8,
+    code: u8,
+    original: &[u8],
+) -> Vec<u8> {
+    let hlen = if original.len() >= 20 {
+        ((original[0] & 0x0f) as usize * 4).min(original.len())
+    } else {
+        original.len()
+    };
+    let quote_len = (hlen + 8).min(original.len());
+    let total = 20 + 8 + quote_len;
+    let mut pkt = ipv4_header(total, PROTO_ICMP, src_ip, dst_ip);
+    let mut icmp = vec![0u8; 8];
+    icmp[0] = icmp_type;
+    icmp[1] = code;
+    icmp.extend_from_slice(&original[..quote_len]);
+    let csum = fold_checksum(add_bytes(0, &icmp));
+    write_u16(&mut icmp, 2, csum);
+    pkt.extend_from_slice(&icmp);
+    finish_frame(dst_mac, src_mac, pkt)
+}
+
+/// Build a TCP RST that answers `seg_*`, the segment being refused.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tcp_rst(
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    ack_flag: bool,
+) -> Vec<u8> {
+    let mut pkt = ipv4_header(40, PROTO_TCP, src_ip, dst_ip);
+    let mut tcp = vec![0u8; 20];
+    write_u16(&mut tcp, 0, src_port);
+    write_u16(&mut tcp, 2, dst_port);
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = 5 << 4;
+    tcp[13] = if ack_flag { 0x14 } else { 0x04 };
+    pkt.extend_from_slice(&tcp);
+    let mut frame = finish_frame(dst_mac, src_mac, pkt);
+    if let Some(mut ip) = Ipv4::parse(&mut frame[ETH_HEADER_LEN..]) {
+        ip.recompute_transport_checksum();
+    }
+    frame
 }
 
 pub fn icmp_identity(ip: &Ipv4) -> u16 {
@@ -423,5 +525,78 @@ mod tests {
         let info = parse_arp(&buf[ETH_HEADER_LEN..n]).unwrap();
         assert_eq!(info.operation, 1);
         assert_eq!(info.target_ip, Ipv4Addr::new(10, 0, 0, 2));
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    fn original() -> Vec<u8> {
+        let mut pkt = ipv4_header(28, PROTO_UDP, "10.0.0.2".parse().unwrap(), "192.0.2.9".parse().unwrap());
+        pkt.extend_from_slice(&[0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]);
+        let mut frame = finish_frame([1; 6], [2; 6], pkt);
+        frame.drain(..ETH_HEADER_LEN);
+        frame
+    }
+
+    #[test]
+    fn icmp_error_quotes_original_and_checksums() {
+        let orig = original();
+        let mut frame = build_icmp_error(
+            [1; 6],
+            [2; 6],
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            11,
+            0,
+            &orig,
+        );
+        assert_eq!(ethertype(&frame), ETHERTYPE_IPV4);
+        let ip = Ipv4::parse(&mut frame[ETH_HEADER_LEN..]).unwrap();
+        assert!(ip.checksum_valid());
+        assert_eq!(ip.protocol(), PROTO_ICMP);
+        let icmp = ip.transport();
+        assert_eq!(icmp[0], 11);
+        assert_eq!(&icmp[8..], &orig[..28]);
+        let sum = add_bytes(0, icmp);
+        assert_eq!(fold_checksum(sum), 0);
+    }
+
+    #[test]
+    fn tcp_rst_has_valid_checksums() {
+        let mut frame = build_tcp_rst(
+            [1; 6],
+            [2; 6],
+            "192.0.2.9".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            80,
+            40000,
+            0,
+            1001,
+            true,
+        );
+        let ip = Ipv4::parse(&mut frame[ETH_HEADER_LEN..]).unwrap();
+        assert!(ip.checksum_valid());
+        assert_eq!(ip.tcp_flags(), Some(0x14));
+        let t = ip.transport().to_vec();
+        let mut sum = 0u64;
+        sum = add_bytes(sum, &ip.src().octets());
+        sum = add_bytes(sum, &ip.dst().octets());
+        sum += PROTO_TCP as u64;
+        sum += t.len() as u64;
+        sum = add_bytes(sum, &t);
+        assert_eq!(fold_checksum(sum), 0);
+    }
+
+    #[test]
+    fn detects_fragments() {
+        let mut orig = original();
+        assert!(!Ipv4::parse(&mut orig).unwrap().is_fragment());
+        orig[6] = 0x20; // more-fragments
+        assert!(Ipv4::parse(&mut orig).unwrap().is_fragment());
+        orig[6] = 0x00;
+        orig[7] = 0x08; // non-zero offset
+        assert!(Ipv4::parse(&mut orig).unwrap().is_fragment());
     }
 }

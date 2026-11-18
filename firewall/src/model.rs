@@ -222,6 +222,7 @@ pub struct ZoneProtection {
     pub vdom: String,
     pub syn_flood: Option<u32>,
     pub icmp_flood: Option<u32>,
+    pub udp_flood: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +284,8 @@ impl fmt::Display for Proto {
 pub enum Action {
     Permit,
     Deny,
+    /// Drop and tell the sender (TCP RST or ICMP unreachable).
+    Reject,
 }
 
 impl Action {
@@ -290,7 +293,10 @@ impl Action {
         match s {
             "permit" | "accept" | "allow" => Ok(Action::Permit),
             "deny" | "drop" => Ok(Action::Deny),
-            other => Err(format!("invalid action '{other}' (permit or deny)")),
+            "reject" => Ok(Action::Reject),
+            other => Err(format!(
+                "invalid action '{other}' (permit, deny or reject)"
+            )),
         }
     }
 
@@ -298,6 +304,7 @@ impl Action {
         match self {
             Action::Permit => "permit",
             Action::Deny => "deny",
+            Action::Reject => "reject",
         }
     }
 }
@@ -344,6 +351,9 @@ pub struct Policy {
     pub av: Option<String>,
     pub shaper: Option<String>,
     pub log: bool,
+    /// Disabled policies stay in the configuration but never match.
+    pub enabled: bool,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -363,6 +373,10 @@ pub struct Settings {
     pub icmp_timeout: u64,
     pub logging: bool,
     pub log_json: bool,
+    /// Global cap on tracked flows; 0 disables the cap.
+    pub max_sessions: usize,
+    /// Cap on tracked flows opened by one source address; 0 disables it.
+    pub max_sessions_per_ip: usize,
 }
 
 impl Default for Settings {
@@ -376,6 +390,8 @@ impl Default for Settings {
             icmp_timeout: 10,
             logging: true,
             log_json: false,
+            max_sessions: 100_000,
+            max_sessions_per_ip: 0,
         }
     }
 }
@@ -467,6 +483,16 @@ impl Config {
                 s.icmp_timeout = value
                     .parse()
                     .map_err(|_| "invalid conntrack-icmp".to_string())?
+            }
+            "max-sessions" => {
+                s.max_sessions = value
+                    .parse()
+                    .map_err(|_| "invalid max-sessions".to_string())?
+            }
+            "max-sessions-per-ip" => {
+                s.max_sessions_per_ip = value
+                    .parse()
+                    .map_err(|_| "invalid max-sessions-per-ip".to_string())?
             }
             "logging" => match value {
                 "on" | "yes" | "true" => s.logging = true,
@@ -605,6 +631,8 @@ impl Config {
             av: None,
             shaper: None,
             log: true,
+            enabled: true,
+            name: None,
         };
         let mut i = 8;
         while i < words.len() {
@@ -620,6 +648,21 @@ impl Config {
                 "nolog" => {
                     policy.log = false;
                     i += 1;
+                }
+                "disable" => {
+                    policy.enabled = false;
+                    i += 1;
+                }
+                "enable" => {
+                    policy.enabled = true;
+                    i += 1;
+                }
+                "name" => {
+                    let value = words
+                        .get(i + 1)
+                        .ok_or_else(|| "policy option 'name' needs a value".to_string())?;
+                    policy.name = Some(value.to_string());
+                    i += 2;
                 }
                 key @ ("app" | "url" | "ips" | "av" | "shaper") => {
                     let value = words
@@ -864,7 +907,7 @@ impl Config {
 
     fn parse_zone(&mut self, words: &[&str]) -> Result<(), String> {
         if words.len() != 3 {
-            return Err("usage: zone <name> syn-flood|icmp-flood <pps>".to_string());
+            return Err("usage: zone <name> syn-flood|icmp-flood|udp-flood <pps>".to_string());
         }
         let pps = words[2]
             .parse()
@@ -879,6 +922,7 @@ impl Config {
                 vdom: self.current_vdom.clone(),
                 syn_flood: None,
                 icmp_flood: None,
+                udp_flood: None,
             });
         }
         let zone = self
@@ -889,6 +933,7 @@ impl Config {
         match words[1] {
             "syn-flood" => zone.syn_flood = Some(pps),
             "icmp-flood" => zone.icmp_flood = Some(pps),
+            "udp-flood" => zone.udp_flood = Some(pps),
             other => return Err(format!("unknown zone protection '{other}'")),
         }
         Ok(())
@@ -1131,7 +1176,7 @@ impl Config {
     ) -> Option<&Policy> {
         self.policies
             .iter()
-            .filter(|p| p.vdom == vdom)
+            .filter(|p| p.vdom == vdom && p.enabled)
             .filter(|p| p.src_zone == src_zone && p.dst_zone == dst_zone)
             .filter(|p| self.addr_matches(&p.src, src) && self.addr_matches(&p.dst, dst))
             .filter(|p| p.proto.matches(proto))
@@ -1156,6 +1201,11 @@ impl Config {
         out.push_str(&format!("system hostname {}\n", s.hostname));
         out.push_str(&format!("system cli-port {}\n", s.cli_port));
         out.push_str(&format!("system gui-port {}\n", s.gui_port));
+        out.push_str(&format!("system max-sessions {}\n", s.max_sessions));
+        out.push_str(&format!(
+            "system max-sessions-per-ip {}\n",
+            s.max_sessions_per_ip
+        ));
         out.push_str(&format!("system conntrack-tcp {}\n", s.tcp_timeout));
         out.push_str(&format!("system conntrack-udp {}\n", s.udp_timeout));
         out.push_str(&format!("system conntrack-icmp {}\n", s.icmp_timeout));
@@ -1289,6 +1339,12 @@ impl Config {
                 if !p.log {
                     out.push_str(" nolog");
                 }
+                if !p.enabled {
+                    out.push_str(" disable");
+                }
+                if let Some(name) = &p.name {
+                    out.push_str(&format!(" name {name}"));
+                }
                 if let Some(app) = &p.app {
                     out.push_str(&format!(" app {app}"));
                 }
@@ -1327,6 +1383,9 @@ impl Config {
                 }
                 if let Some(pps) = zone.icmp_flood {
                     out.push_str(&format!("zone {} icmp-flood {}\n", zone.name, pps));
+                }
+                if let Some(pps) = zone.udp_flood {
+                    out.push_str(&format!("zone {} udp-flood {}\n", zone.name, pps));
                 }
             }
             out.push('\n');
@@ -1641,6 +1700,42 @@ route default a2
         let (iface, next) = cfg.egress("root", "1.1.1.1".parse().unwrap()).unwrap();
         assert_eq!(iface.name, "port1");
         assert_eq!(next, "10.0.0.254".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn reject_disable_and_name_round_trip() {
+        let text = "interface a zone lan address 10.0.0.1/24\ninterface b zone wan address 192.0.2.1/24\npolicy 5 lan wan any any tcp 23 reject name no-telnet\npolicy 10 lan wan any any any any permit disable\npolicy 20 lan wan any any any any permit\nsystem max-sessions 500\nsystem max-sessions-per-ip 20\nzone lan udp-flood 50\n";
+        let cfg = Config::parse(text).unwrap();
+        let p5 = cfg.policies.iter().find(|p| p.id == 5).unwrap();
+        assert_eq!(p5.action, Action::Reject);
+        assert_eq!(p5.name.as_deref(), Some("no-telnet"));
+        let p10 = cfg.policies.iter().find(|p| p.id == 10).unwrap();
+        assert!(!p10.enabled);
+        assert_eq!(cfg.settings.max_sessions, 500);
+        assert_eq!(cfg.settings.max_sessions_per_ip, 20);
+        assert_eq!(cfg.zones[0].udp_flood, Some(50));
+        assert_eq!(
+            Config::parse(&cfg.to_text()).unwrap().to_text(),
+            cfg.to_text()
+        );
+    }
+
+    #[test]
+    fn disabled_policy_never_matches() {
+        let text = "interface a zone lan address 10.0.0.1/24\ninterface b zone wan address 192.0.2.1/24\npolicy 10 lan wan any any any any deny disable\npolicy 20 lan wan any any any any permit\n";
+        let cfg = Config::parse(text).unwrap();
+        let hit = cfg
+            .match_policy(
+                "root",
+                "lan",
+                "wan",
+                "10.0.0.5".parse().unwrap(),
+                "192.0.2.9".parse().unwrap(),
+                6,
+                80,
+            )
+            .unwrap();
+        assert_eq!(hit.id, 20);
     }
 
     #[test]

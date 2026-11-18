@@ -1,5 +1,7 @@
 # VELA NGFW Feature Checklist
 
+> Update 2026-11-18 (after the audit below): a hardening pass added a TCP state machine, SYN-only flow creation, reply-direction inspection, fragment/martian/LAND/bad-flag drops, ICMP Time Exceeded / Unreachable, a Reject action, policy enable/disable/name/hit counters, UDP flood limit, session limits and O(1) PAT port allocation. This pass was ported from `firewall-new/`, then verified with `cargo test` (41/41), the two-firewall containerlab chain (10/10) and the single-firewall containerlab policy test (4/4). Features exercised only by unit tests remain marked `[~]`.
+
 Audit date: 2026-11-18  
 Scope: `/home/deepak/NetworkSandbox/prompt.txt` (master prompt) against the `firewall/` implementation.  
 Rule: a feature is checked only when the repository contains a working implementation and it has been exercised. A UI page, API stub, or unused field does not count as implemented.
@@ -87,7 +89,7 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [ ] IPv6 filtering.
 - [x] TCP, UDP and ICMP filtering.
 - [x] Connection tracking and stateful return traffic.
-- [~] NEW/ESTABLISHED/RELATED/INVALID state model; implementation tracks forward/reverse sessions and timeouts, not the full state taxonomy.
+- [~] TCP state model: SYN_SENT/SYN_RECV/ESTABLISHED/CLOSING/TIME_WAIT/CLOSED with per-state timeouts, INVALID packets dropped; no sequence-window checks, no RELATED tracking for ICMP errors/helpers. Unit-tested and exercised by the containerlab TCP flow.
 - [x] Default deny when no policy matches.
 - [x] Source and destination IP filtering.
 - [~] Destination port filtering; there is no source-port field.
@@ -97,15 +99,15 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 - [x] Address objects and address groups.
 - [ ] Service groups.
 - [x] Rule ordering by ascending rule ID.
-- [ ] Rule enable/disable.
-- [ ] Rule names.
+- [~] Rule enable/disable (`disable` policy option): implemented and unit-tested; not yet run in a lab.
+- [~] Rule names (`name <word>` policy option): implemented and unit-tested.
 - [ ] Rule descriptions.
-- [ ] Per-rule hit counters.
+- [~] Per-rule hit counters (packets/bytes/last hit) shown in `show policies`; not yet run in a lab.
 - [ ] Last-match timestamps.
 - [x] Per-rule logging toggle.
 - [x] Basic policy validation.
 - [x] Permit and deny actions.
-- [ ] Reject action (TCP reset / ICMP unreachable).
+- [~] Reject action (TCP RST / ICMP unreachable): implemented in the dataplane with unit tests for the packet builders; not yet run in a lab.
 - [x] Log action behavior through per-rule logging and policy logs.
 - [~] Rate limiting through shapers and zone flood limits; no general per-rule rate limit.
 - [ ] Rules compiled into kernel enforcement rules.
@@ -254,15 +256,15 @@ The largest missing areas are kernel enforcement (`nftables`/conntrack/NFQUEUE/e
 
 - [x] SYN flood threshold per zone.
 - [x] ICMP flood threshold per zone.
-- [ ] UDP flood threshold.
-- [ ] Excessive connection creation limit.
-- [ ] Connection table exhaustion protection/limit.
+- [~] UDP flood threshold (`zone <z> udp-flood <pps>`, counts new flows): implemented and parse-tested.
+- [~] Excessive connection creation limit: `system max-sessions-per-ip`.
+- [~] Connection table limit: `system max-sessions` (default 100000).
 - [ ] Per-source rate limiting.
 - [ ] Automatic temporary source blocking (current flood check drops packets in a time window; no address ban list).
 - [x] Flood event logging.
 - [x] Per-interface packet/drop statistics.
 - [x] Documentation that this is not volumetric DDoS mitigation.
-- [ ] Configurable global memory/session limits.
+- [~] Configurable global session limits: `max-sessions`, `max-sessions-per-ip`; no memory limit.
 
 ## 16. VPN
 
