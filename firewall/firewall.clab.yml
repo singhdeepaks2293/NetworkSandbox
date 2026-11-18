@@ -8,12 +8,14 @@ name: firewall-lab
 # Deploy:
 #   make image
 #   containerlab deploy -t firewall.clab.yml
-#   docker exec -it clab-firewall-lab-fw /firewall cli -c "show policies"
+#   docker cp clab-firewall-lab-fw:/etc/firewall/firewall.bootstrap-password /tmp/fw-pw
+#   docker exec -e VELA_CLI_USERNAME=admin -e VELA_CLI_PASSWORD="$(cat /tmp/fw-pw)" \
+#     clab-firewall-lab-fw /firewall cli -c "show policies"
 #   docker exec -it clab-firewall-lab-pc-lan ping -c 3 10.0.0.99
-#   curl http://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' clab-firewall-lab-fw):8080/api/state
+#   curl -k https://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' clab-firewall-lab-fw):8080/api/v1/state
 #
-# The web GUI is unauthenticated and binds 0.0.0.0:8080, so treat the lab
-# management network as trusted.
+# The web GUI requires login and serves a self-signed TLS certificate by
+# default; it binds 0.0.0.0:8080 inside the container.
 
 topology:
   nodes:

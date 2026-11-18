@@ -13,6 +13,22 @@ FAILED=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
+# The daemon bootstraps an admin and writes the one-time password beside its
+# config. Tests authenticate with it instead of disabling management auth.
+fw_cli() {
+    local node=$1; shift
+    local tmp pw
+    tmp=$(mktemp)
+    if ! docker cp "$node:/etc/firewall/firewall.bootstrap-password" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    pw=$(cat "$tmp")
+    rm -f "$tmp"
+    docker exec -e VELA_CLI_USERNAME=admin -e VELA_CLI_PASSWORD="$pw" \
+        "$node" /firewall cli --port 2200 "$@"
+}
+
 command -v containerlab >/dev/null || {
     echo "containerlab is not installed" >&2
     exit 2
@@ -45,14 +61,14 @@ else
     fail "pc-wan -> pc-lan: $out"
 fi
 
-sessions=$(docker exec "$PREFIX-fw" /firewall cli --port 2200 -c "show sessions")
+sessions=$(fw_cli "$PREFIX-fw" -c "show sessions")
 if echo "$sessions" | grep -q '10.0.0.1:'; then
     pass "source NAT session present"
 else
     fail "no SNAT session: $sessions"
 fi
 
-docker exec "$PREFIX-fw" /firewall cli --port 2200 \
+fw_cli "$PREFIX-fw" \
     -c "policy add 5 wan lan any any icmp any deny" >/dev/null
 out=$(ip netns exec "$PREFIX-pc-wan" ping -c 2 -W 1 192.168.10.10 2>&1)
 if echo "$out" | grep -q '100% packet loss'; then

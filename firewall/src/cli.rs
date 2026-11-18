@@ -1,7 +1,12 @@
-//! A small vendor-neutral CLI, reachable on stdin or over TCP.
+//! An authenticated CLI, reachable on stdin or over TCP.
+//!
+//! The transport carries credentials, so the listener binds loopback by
+//! default. Remote use should go through an authenticated tunnel.
 
+use crate::auth::{Auth, Session};
 use crate::dataplane::Engine;
 use crate::model::{Config, Policy};
+use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -9,35 +14,57 @@ use std::time::Duration;
 
 pub const END_MARKER: &str = "__END__";
 
-pub fn serve(engine: Arc<Engine>) {
-    let port = engine.cfg.read().unwrap().settings.cli_port;
-    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+#[derive(Deserialize)]
+struct LoginLine {
+    action: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    token: String,
+}
+
+pub fn serve(engine: Arc<Engine>, auth: Arc<Auth>) {
+    let (bind, port) = {
+        let cfg = engine.cfg.read().unwrap();
+        (cfg.settings.cli_bind, cfg.settings.cli_port)
+    };
+    let listener = match TcpListener::bind((bind, port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("cli: cannot listen on port {port}: {e}");
+            eprintln!("cli: cannot listen on {bind}:{port}: {e}");
             return;
         }
     };
-    println!("cli: listening on tcp/{port}");
+    if !bind.is_loopback() {
+        eprintln!(
+            "cli: listening on {bind}:{port} (authenticated plaintext; use an encrypted tunnel)"
+        );
+    } else {
+        println!("cli: listening on {bind}:{port}");
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let engine = engine.clone();
-                std::thread::spawn(move || handle_client(&engine, stream));
+                let auth = auth.clone();
+                std::thread::spawn(move || handle_client(&engine, &auth, stream));
             }
             Err(e) => eprintln!("cli: accept: {e}"),
         }
     }
 }
 
-fn handle_client(engine: &Engine, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
+fn handle_client(engine: &Engine, auth: &Auth, stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     });
     let mut writer = stream;
     let mut line = String::new();
+    let mut session: Option<Session> = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -45,14 +72,83 @@ fn handle_client(engine: &Engine, stream: TcpStream) {
             Ok(_) => {}
             Err(_) => break,
         }
-        let response = execute(engine, line.trim());
+        let line = line.trim();
+        let response = match session.as_ref() {
+            Some(session) => {
+                if !authorized(session, line) {
+                    "error: permission denied for this role".to_string()
+                } else {
+                    let response = execute(engine, line);
+                    auth.audit(&session.username, "cli.command", audit_detail(line));
+                    response
+                }
+            }
+            None => match authenticate_line(auth, line) {
+                Ok(Some((token, new_session))) => {
+                    let _ = token;
+                    let response = format!(
+                        "authenticated as {} ({})",
+                        new_session.username,
+                        new_session.role.as_str()
+                    );
+                    session = Some(new_session);
+                    response
+                }
+                Ok(None) if matches!(line, "help" | "?") => help(),
+                Ok(None) if matches!(line, "quit" | "exit") => "bye".to_string(),
+                Ok(None) => "authentication required: send {\"action\":\"login\",\"username\":\"...\",\"password\":\"...\"}".to_string(),
+                Err(e) => format!("error: {e}"),
+            },
+        };
         if writer
             .write_all(format!("{response}\n{END_MARKER}\n").as_bytes())
             .is_err()
         {
             break;
         }
+        if session.is_none() && matches!(line, "quit" | "exit") {
+            break;
+        }
     }
+}
+
+fn authenticate_line(auth: &Auth, line: &str) -> Result<Option<(String, Session)>, String> {
+    if !line.starts_with('{') {
+        return Ok(None);
+    }
+    let request: LoginLine =
+        serde_json::from_str(line).map_err(|_| "invalid login request".to_string())?;
+    match request.action.as_str() {
+        "login" => {
+            let (token, session) = auth.login(&request.username, &request.password)?;
+            Ok(Some((token, session)))
+        }
+        "token" => {
+            let session = auth
+                .authenticate_api_token(&request.token)
+                .ok_or_else(|| "invalid or expired API token".to_string())?;
+            Ok(Some((request.token, session)))
+        }
+        _ => Err("login request action must be login or token".to_string()),
+    }
+}
+
+fn authorized(session: &Session, line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let word = words.next().unwrap_or("");
+    match word {
+        "" | "help" | "?" | "quit" | "exit" | "show" => true,
+        "save" | "write" => session.role.can_write(),
+        "policy" => {
+            let action = words.next().unwrap_or("");
+            matches!(action, "add" | "delete" | "del") && session.role.can_write()
+        }
+        _ => session.role.can_write(),
+    }
+}
+
+fn audit_detail(line: &str) -> &str {
+    line
 }
 
 pub fn execute(engine: &Engine, line: &str) -> String {
@@ -291,6 +387,7 @@ pub fn run_client(host: &str, port: u16, command: Option<&str>) -> std::io::Resu
     let mut stream = TcpStream::connect((host, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    login(&mut stream, &mut reader)?;
     match command {
         Some(cmd) => {
             stream.write_all(format!("{cmd}\n").as_bytes())?;
@@ -312,6 +409,31 @@ pub fn run_client(host: &str, port: u16, command: Option<&str>) -> std::io::Resu
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn login(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>) -> std::io::Result<()> {
+    let request = if let Ok(token) = std::env::var("VELA_API_TOKEN") {
+        serde_json::json!({"action": "token", "token": token}).to_string()
+    } else {
+        let username = std::env::var("VELA_CLI_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let password = std::env::var("VELA_CLI_PASSWORD").map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "set VELA_CLI_PASSWORD or VELA_API_TOKEN (or use an SSH tunnel to run the daemon-side CLI)",
+            )
+        })?;
+        serde_json::json!({"action": "login", "username": username, "password": password})
+            .to_string()
+    };
+    stream.write_all(format!("{request}\n").as_bytes())?;
+    let response = read_response(reader)?;
+    if response.starts_with("error:") || !response.starts_with("authenticated as ") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            response,
+        ));
     }
     Ok(())
 }

@@ -196,6 +196,69 @@ impl<'a> Ipv4<'a> {
         read_u16(self.data, 6) & 0x3fff != 0
     }
 
+    /// Validate transport header lengths that the policy engine relies on.
+    /// Fragments are rejected separately because their transport header is
+    /// incomplete and cannot be validated here.
+    pub fn transport_sane(&self) -> bool {
+        let t = self.transport();
+        match self.protocol() {
+            PROTO_TCP => {
+                if t.len() < 20 {
+                    return false;
+                }
+                let data_offset = (t[12] >> 4) as usize * 4;
+                data_offset >= 20 && data_offset <= t.len()
+            }
+            PROTO_UDP => {
+                if t.len() < 8 {
+                    return false;
+                }
+                let udp_len = read_u16(t, 4) as usize;
+                udp_len >= 8 && udp_len <= t.len()
+            }
+            PROTO_ICMP => t.len() >= 8,
+            _ => true,
+        }
+    }
+
+    /// Validate the TCP/UDP pseudo-header checksum and the ICMP checksum.
+    /// A zero UDP checksum means the sender omitted it, which IPv4 permits.
+    pub fn transport_checksum_valid(&self) -> bool {
+        let t = self.transport();
+        let sum = match self.protocol() {
+            PROTO_TCP | PROTO_UDP => {
+                let len = if self.protocol() == PROTO_UDP {
+                    if t.len() < 8 {
+                        return false;
+                    }
+                    if read_u16(t, 6) == 0 {
+                        return true;
+                    }
+                    read_u16(t, 4) as usize
+                } else {
+                    t.len()
+                };
+                if len > t.len() {
+                    return false;
+                }
+                let t = &t[..len];
+                let mut sum = 0;
+                sum = add_bytes(sum, &self.src().octets());
+                sum = add_bytes(sum, &self.dst().octets());
+                sum += self.protocol() as u64;
+                sum += len as u64;
+                add_bytes(sum, t)
+            }
+            PROTO_ICMP => add_bytes(0, t),
+            _ => return true,
+        };
+        let mut folded = sum;
+        while folded >> 16 != 0 {
+            folded = (folded & 0xffff) + (folded >> 16);
+        }
+        folded as u16 == 0xffff
+    }
+
     pub fn icmp_type(&self) -> Option<u8> {
         if self.protocol() != PROTO_ICMP {
             return None;
@@ -477,6 +540,37 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_transport_checksum_is_rejected() {
+        let mut p = sample_ipv4();
+        let mut ip = Ipv4::parse(&mut p).unwrap();
+        ip.recompute_header_checksum();
+        assert!(ip.transport_checksum_valid());
+        ip.data[ip.header_len() + 2] ^= 0xff;
+        let ip = Ipv4::parse(&mut p).unwrap();
+        assert!(!ip.transport_checksum_valid());
+    }
+
+    #[test]
+    fn malformed_transport_headers_are_rejected() {
+        let mut p = sample_ipv4();
+        p.resize(40, 0);
+        write_u16(&mut p, 2, 40);
+        p[9] = PROTO_TCP;
+        p[32] = 5 << 4;
+        {
+            let ip = Ipv4::parse(&mut p).unwrap();
+            assert!(ip.transport_sane());
+            assert!(!ip.transport_checksum_valid());
+        }
+        p[32] = 0;
+        let ip = Ipv4::parse(&mut p).unwrap();
+        assert!(!ip.transport_sane());
+        p[9] = PROTO_UDP;
+        let ip = Ipv4::parse(&mut p).unwrap();
+        assert!(!ip.transport_sane());
+    }
+
+    #[test]
     fn udp_checksum_is_valid_after_rewrite() {
         let mut p = vec![0u8; 20 + 8 + 3];
         p[0] = 0x45;
@@ -533,7 +627,12 @@ mod builder_tests {
     use super::*;
 
     fn original() -> Vec<u8> {
-        let mut pkt = ipv4_header(28, PROTO_UDP, "10.0.0.2".parse().unwrap(), "192.0.2.9".parse().unwrap());
+        let mut pkt = ipv4_header(
+            28,
+            PROTO_UDP,
+            "10.0.0.2".parse().unwrap(),
+            "192.0.2.9".parse().unwrap(),
+        );
         pkt.extend_from_slice(&[0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]);
         let mut frame = finish_frame([1; 6], [2; 6], pkt);
         frame.drain(..ETH_HEADER_LEN);
@@ -587,6 +686,32 @@ mod builder_tests {
         sum += t.len() as u64;
         sum = add_bytes(sum, &t);
         assert_eq!(fold_checksum(sum), 0);
+    }
+
+    #[test]
+    fn parsers_survive_truncated_and_pseudo_random_input() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for len in 0..256usize {
+            let mut bytes = vec![0u8; len];
+            for b in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            assert!(ethertype(&bytes) <= u16::MAX);
+            let _ = parse_arp(&bytes);
+            let mut copy = bytes;
+            if let Some(ip) = Ipv4::parse(&mut copy) {
+                let _ = ip.ports();
+                let _ = ip.tcp_flags();
+                let _ = ip.icmp_type();
+                let _ = icmp_identity(&ip);
+                let _ = ip.is_fragment();
+                let _ = ip.transport_sane();
+                let _ = ip.transport_checksum_valid();
+            }
+        }
     }
 
     #[test]

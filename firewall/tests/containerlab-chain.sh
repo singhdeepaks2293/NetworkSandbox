@@ -12,6 +12,22 @@ FAILED=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
+# The daemon bootstraps an admin and writes the one-time password beside its
+# config. Tests authenticate with it instead of disabling management auth.
+fw_cli() {
+    local node=$1; shift
+    local tmp pw
+    tmp=$(mktemp)
+    if ! docker cp "$node:/etc/firewall/firewall.bootstrap-password" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    pw=$(cat "$tmp")
+    rm -f "$tmp"
+    docker exec -e VELA_CLI_USERNAME=admin -e VELA_CLI_PASSWORD="$pw" \
+        "$node" /firewall cli --port 2200 "$@"
+}
+
 command -v containerlab >/dev/null || { echo "containerlab is not installed" >&2; exit 2; }
 docker image inspect switch:latest >/dev/null 2>&1 || { echo "switch:latest missing (see /home/deepak/NetworkSandbox/switch)" >&2; exit 2; }
 docker image inspect firewall:latest >/dev/null 2>&1 || { echo "firewall:latest missing; run 'make image'" >&2; exit 2; }
@@ -43,8 +59,8 @@ done
 sleep 1
 
 for _ in $(seq 1 30); do
-    docker exec "$PREFIX-fw1" /firewall cli --port 2200 -c "show version" >/dev/null 2>&1 \
-        && docker exec "$PREFIX-fw2" /firewall cli --port 2200 -c "show version" >/dev/null 2>&1 \
+    fw_cli "$PREFIX-fw1" -c "show version" >/dev/null 2>&1 \
+        && fw_cli "$PREFIX-fw2" -c "show version" >/dev/null 2>&1 \
         && break
     sleep 0.5
 done
@@ -66,8 +82,8 @@ else
     fail "pc2 -> pc1: $out"
 fi
 
-sessions1=$(docker exec "$PREFIX-fw1" /firewall cli --port 2200 -c "show sessions")
-sessions2=$(docker exec "$PREFIX-fw2" /firewall cli --port 2200 -c "show sessions")
+sessions1=$(fw_cli "$PREFIX-fw1" -c "show sessions")
+sessions2=$(fw_cli "$PREFIX-fw2" -c "show sessions")
 if echo "$sessions1" | grep -q '10.0.0.1:' && echo "$sessions2" | grep -q '10.0.0.2:'; then
     pass "both firewalls hold source-NAT sessions"
 else
@@ -83,7 +99,7 @@ else
     fail "TCP 9000 through chain: $tcp_out"
 fi
 
-sessions1=$(docker exec "$PREFIX-fw1" /firewall cli --port 2200 -c "show sessions")
+sessions1=$(fw_cli "$PREFIX-fw1" -c "show sessions")
 if echo "$sessions1" | grep -qE '^[^ ]+ +6 +'; then
     pass "fw1 tracks the TCP flow"
 else
@@ -116,14 +132,14 @@ else
 fi
 docker exec "$PREFIX-pc2" pkill nc >/dev/null 2>&1
 
-sessions2=$(docker exec "$PREFIX-fw2" /firewall cli --port 2200 -c "show sessions")
+sessions2=$(fw_cli "$PREFIX-fw2" -c "show sessions")
 if echo "$sessions2" | grep -q 'dnat 192.168.2.10:8080'; then
     pass "fw2 records the destination-NAT mapping"
 else
     fail "no DNAT session on fw2"
 fi
 
-docker exec "$PREFIX-fw2" /firewall cli --port 2200 \
+fw_cli "$PREFIX-fw2" \
     -c "policy add 5 transit lan2 any any icmp any deny" >/dev/null
 out=$(docker exec "$PREFIX-pc1" ping -c 2 -W 1 192.168.2.10 2>&1)
 if echo "$out" | grep -q '100% packet loss'; then
@@ -131,7 +147,7 @@ if echo "$out" | grep -q '100% packet loss'; then
 else
     fail "deny policy on fw2 did not block: $out"
 fi
-docker exec "$PREFIX-fw2" /firewall cli --port 2200 -c "policy delete 5" >/dev/null
+fw_cli "$PREFIX-fw2" -c "policy delete 5" >/dev/null
 out=$(docker exec "$PREFIX-pc1" ping -c 3 -W 2 192.168.2.10 2>&1)
 if echo "$out" | grep -qE '[1-9][0-9]* packets received'; then
     pass "chain recovers after deleting the deny policy"

@@ -74,7 +74,10 @@ pub fn tcp_flags_sane(flags: u8) -> bool {
     let syn = flags & TCP_SYN != 0;
     let fin = flags & TCP_FIN != 0;
     let rst = flags & TCP_RST != 0;
-    flags & (TCP_FIN | TCP_SYN | TCP_RST | TCP_ACK) != 0 && !(syn && fin) && !(syn && rst) && !(fin && rst)
+    flags & (TCP_FIN | TCP_SYN | TCP_RST | TCP_ACK) != 0
+        && !(syn && fin)
+        && !(syn && rst)
+        && !(fin && rst)
 }
 
 /// Advance the TCP state machine for one packet. `from_orig` is true for the
@@ -360,6 +363,7 @@ pub struct Engine {
     pub config_path: Option<PathBuf>,
     flood: Mutex<HashMap<String, FloodCounter>>,
     shapers: Mutex<HashMap<String, ShaperBucket>>,
+    source_packets: Mutex<HashMap<Ipv4Addr, ShaperBucket>>,
     pub logs: Mutex<VecDeque<String>>,
     /// Per-policy counters keyed by (vdom, policy id): packets, bytes, last
     /// hit as unix seconds.
@@ -455,6 +459,7 @@ impl Engine {
             config_path,
             flood: Mutex::new(HashMap::new()),
             shapers: Mutex::new(HashMap::new()),
+            source_packets: Mutex::new(HashMap::new()),
             logs: Mutex::new(VecDeque::new()),
             hits: Mutex::new(HashMap::new()),
             candidate: Mutex::new(None),
@@ -553,7 +558,15 @@ impl Engine {
         };
         let (sport, _) = ip.ports().unwrap_or((0, 0));
         let frame = build_tcp_rst(
-            src_mac, out.mac, peer_ip, ip.src(), peer_port, sport, rseq, rack, with_ack,
+            src_mac,
+            out.mac,
+            peer_ip,
+            ip.src(),
+            peer_port,
+            sport,
+            rseq,
+            rack,
+            with_ack,
         );
         self.send(slot, &frame);
     }
@@ -671,17 +684,6 @@ impl Engine {
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
-    }
-
-    pub fn replace_config(&self, text: &str) -> Result<(), String> {
-        let parsed = Config::parse(text)?;
-        self.ensure_live_compatible(&parsed)?;
-        let old = self.cfg.read().unwrap().to_text();
-        self.save_text(text)?;
-        *self.cfg.write().unwrap() = parsed;
-        self.push_history(old);
-        *self.revisions.lock().unwrap() += 1;
-        Ok(())
     }
 
     /// Interface changes cannot be applied to a running AF_PACKET engine
@@ -871,6 +873,12 @@ impl Engine {
                         if addr.sll_pkttype == libc::PACKET_OUTGOING {
                             continue;
                         }
+                        let max_packet = self.cfg.read().unwrap().settings.max_packet_size;
+                        if n as usize > max_packet {
+                            self.stats.lock().unwrap().errors += 1;
+                            self.stats_bump(slot, |s| s.dropped += 1);
+                            continue;
+                        }
                         let frame = &mut buf[..n as usize];
                         self.handle(slot, frame);
                     }
@@ -883,8 +891,44 @@ impl Engine {
                     .lock()
                     .unwrap()
                     .retain(|_, (_, seen)| now.duration_since(*seen) < ARP_TTL);
+                let mut sources = self.source_packets.lock().unwrap();
+                if sources.len() > 4096 {
+                    sources.retain(|_, bucket| {
+                        bucket
+                            .last
+                            .map(|t| now.duration_since(t).as_secs() < 10)
+                            .unwrap_or(false)
+                    });
+                }
                 last_purge = now;
             }
+        }
+    }
+
+    fn source_allowed(&self, src: Ipv4Addr, rate: u32, burst: u32) -> bool {
+        if rate == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let burst = burst.max(1) as f64;
+        let mut buckets = self.source_packets.lock().unwrap();
+        if buckets.len() >= 16384 && !buckets.contains_key(&src) {
+            return false;
+        }
+        let bucket = buckets.entry(src).or_insert(ShaperBucket {
+            tokens: burst,
+            last: None,
+        });
+        if let Some(last) = bucket.last {
+            let elapsed = now.duration_since(last).as_secs_f64();
+            bucket.tokens = (bucket.tokens + elapsed * rate as f64).min(burst);
+        }
+        bucket.last = Some(now);
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -966,6 +1010,25 @@ impl Engine {
         }
         let src = ip.src();
         let original_dst = ip.dst();
+        if !ip.transport_sane() {
+            self.stats_bump(slot, |s| s.dropped += 1);
+            return;
+        }
+        if !ip.transport_checksum_valid() {
+            self.stats.lock().unwrap().errors += 1;
+            self.stats_bump(slot, |s| s.dropped += 1);
+            return;
+        }
+        {
+            let (rate, burst) = {
+                let settings = &self.cfg.read().unwrap().settings;
+                (settings.source_rate, settings.source_burst)
+            };
+            if !self.source_allowed(src, rate, burst) {
+                self.stats_bump(slot, |s| s.dropped += 1);
+                return;
+            }
+        }
 
         // Hold the read lock for this packet instead of cloning the whole
         // configuration. Nothing below takes the config lock again.
@@ -1059,8 +1122,7 @@ impl Engine {
                     .find(|p| p.id == s.policy_id && p.vdom == s.key.vdom);
                 // A flow whose policy was deleted, disabled or turned into a
                 // deny is cut off instead of living on until it times out.
-                let Some(policy) =
-                    policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                let Some(policy) = policy_now.filter(|p| p.enabled && p.action == Action::Permit)
                 else {
                     self.sessions.lock().unwrap().touch(&s.key, 0);
                     self.log_event(
@@ -1149,8 +1211,7 @@ impl Engine {
                     .policies
                     .iter()
                     .find(|p| p.id == s.policy_id && p.vdom == s.key.vdom);
-                let Some(policy) =
-                    policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                let Some(policy) = policy_now.filter(|p| p.enabled && p.action == Action::Permit)
                 else {
                     self.sessions.lock().unwrap().touch(&s.key, 0);
                     self.log_event(
@@ -1663,6 +1724,7 @@ fn security_drop(
 ) -> Option<String> {
     let _ = dport;
     let payload = crate::inspect::payload(ip);
+    let payload = &payload[..payload.len().min(cfg.settings.max_inspection_bytes)];
     // Inspection is not tied to a well-known port: HTTP and TLS are
     // recognised from the payload so non-standard listeners still work.
     let host = crate::inspect::http_host(payload).or_else(|| crate::inspect::tls_sni(payload));

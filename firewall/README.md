@@ -61,14 +61,48 @@ sudo ./target/release/firewall daemon --config examples/default.conf
 ```
 
 The daemon needs `CAP_NET_RAW`/root to open AF_PACKET sockets. The CLI and GUI
-listen on TCP ports 2200 and 8080 by default. The CLI is unauthenticated; the
-GUI requires a login.
+both require an authenticated administrator; both bind loopback by default.
+The GUI uses TLS with a generated self-signed certificate when no certificate
+is configured. On first start the daemon creates the `admin` administrator and
+writes its generated password to a mode-0600 file beside the config
+(`<config>.bootstrap-password`), printing the username and file path. Set
+`VELA_ADMIN_PASSWORD` instead to supply your own initial password.
 
 ```sh
+export VELA_CLI_USERNAME=admin VELA_CLI_PASSWORD='the bootstrap password'
 ./target/release/firewall cli --port 2200 -c "show policies"
 ./target/release/firewall cli --port 2200 -c "show sessions"
 ./target/release/firewall cli --port 2200 -c "policy add 100 trust untrust any any any any deny"
+# or reuse a GUI-created API token:
+VELA_API_TOKEN=vela_... ./target/release/firewall cli -c "show version"
 ```
+
+Management settings include `system cli-bind`, `system gui-bind`,
+`system tls on|off`, `system tls-cert`, `system tls-key`, `system api-rate`,
+`system api-burst`, `system max-body`, `system max-packet`,
+`system max-inspection`, `system source-rate` and `system source-burst`.
+For a lost password run `firewall password-reset-token --config PATH
+--username NAME`, then POST the token and a new password to
+`/api/v1/auth/password-reset`.
+
+## Kernel nftables backend (opt-in)
+
+The daemon's userspace engine remains the default dataplane. An explicit
+command installs the same IPv4 zones, policies, state rules, logging, counters,
+DNAT and masquerade rules into the kernel:
+
+```sh
+sudo ./target/release/firewall nft-apply --config examples/ngfw.conf
+sudo nft list table inet vela
+sudo ./target/release/firewall nft-remove
+```
+
+Ownership is limited to `inet vela`; no other table is flushed or modified.
+Each apply atomically replaces that table, so re-run `nft-apply` after
+configuration changes. Kernel enforcement does not start automatically and
+does not track later GUI/CLI edits. Do not run the userspace forwarding engine
+and the kernel rules for the same traffic at the same time. IPv6 is not yet
+translated; `Cidr` and packet handling are IPv4-only.
 
 ## Configuration
 
@@ -114,10 +148,14 @@ shaper objects are shared by every VDOM. A VDOM may have one default route.
 
 ```sh
 cargo test
+sudo bash tests/nft-kernel.sh
 ```
 
-`tests/network-namespace.sh` builds a local namespace topology. The
-containerlab chain test needs the `switch:latest` and `firewall:latest` images:
+`tests/network-namespace.sh` builds a local namespace topology.
+`tests/nft-kernel.sh` checks the nftables backend in an isolated topology:
+default deny, state rules, counters, reject, DNAT, masquerade and table
+removal. Both scripts need root and a release build. The containerlab chain test needs the
+`switch:latest` and `firewall:latest` images:
 
 ```sh
 sudo containerlab deploy -t firewall-chain.clab.yml
@@ -136,9 +174,9 @@ through the chain, DNAT, URL blocking/allowing and an inserted deny policy.
 - HTTP/TLS and signature inspection see one packet at a time, so requests
   split across TCP segments may not match.
 - Signature profiles are literal substring matches, not real IPS/AV engines.
-- The CLI has no authentication. The GUI requires a login and supports
-  admin/operator/auditor RBAC; still expose both only on a trusted management
-  network.
+- The CLI and GUI share the same administrators and RBAC, but the CLI
+  transport is plaintext; bind it to loopback or tunnel it. The GUI supports
+  TLS and still should be exposed only on a trusted management network.
 - ARP misses drop the first packet rather than queueing it.
 - No high-availability, routing protocols, VPN or user identity.
 - VDOMs isolate forwarding configuration, not administrative access; the GUI

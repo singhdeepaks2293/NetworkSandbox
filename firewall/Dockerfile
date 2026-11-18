@@ -1,5 +1,5 @@
 # --- build stage -----------------------------------------------------------
-FROM rust:1.75-alpine AS build
+FROM rust:1.85-alpine AS build
 
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /src
@@ -10,8 +10,14 @@ COPY src ./src
 # Static musl binary, size-optimised (see profile.release in Cargo.toml).
 RUN cargo build --release --locked
 
-RUN mkdir -p /out/etc/firewall
-COPY examples/default.conf /out/etc/firewall/firewall.conf
+RUN mkdir -p /out/etc/firewall \
+    && printf '%s\n' \
+       'system hostname firewall' \
+       'system cli-port 2200' \
+       'system gui-port 8080' \
+       'system tls on' \
+       'system gui-bind 0.0.0.0' \
+       > /out/etc/firewall/firewall.conf
 
 # --- runtime stage ---------------------------------------------------------
 FROM scratch

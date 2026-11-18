@@ -16,6 +16,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSION_SECONDS: u64 = 8 * 60 * 60;
+const TOKEN_DEFAULT_SECONDS: u64 = 90 * 24 * 60 * 60;
+const TOKEN_MAX_SECONDS: u64 = 365 * 24 * 60 * 60;
+const RESET_SECONDS: u64 = 15 * 60;
 const MAX_FAILURES: u32 = 5;
 const LOCK_SECONDS: u64 = 60;
 
@@ -70,6 +73,8 @@ pub struct ApiToken {
     pub hash: String,
     pub role: Role,
     pub created: u64,
+    #[serde(default)]
+    pub expires: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +91,13 @@ pub struct Admin {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Store {
     admins: Vec<Admin>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ResetToken {
+    username: String,
+    hash: String,
+    expires: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -107,15 +119,15 @@ struct Attempt {
 pub struct Auth {
     path: PathBuf,
     audit_path: PathBuf,
+    reset_path: PathBuf,
     store: Mutex<Store>,
     sessions: Mutex<HashMap<String, Session>>,
     attempts: Mutex<HashMap<String, Attempt>>,
-    pub bootstrap_path: Option<PathBuf>,
+    reset_lock: Mutex<()>,
 }
 
 pub struct Bootstrap {
     pub username: String,
-    pub password: String,
     pub path: PathBuf,
 }
 
@@ -126,13 +138,16 @@ impl Auth {
     pub fn load(config_path: &Path) -> Result<(Auth, Option<Bootstrap>), String> {
         let path = config_path.with_extension("auth.json");
         let audit_path = config_path.with_extension("audit.log");
+        let reset_path = config_path.with_extension("reset.json");
         let mut bootstrap = None;
         let store = if path.exists() {
             let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
             serde_json::from_slice::<Store>(&bytes)
                 .map_err(|e| format!("parse {}: {e}", path.display()))?
         } else {
-            let password = std::env::var("VELA_ADMIN_PASSWORD").ok().filter(|p| p.len() >= 8);
+            let password = std::env::var("VELA_ADMIN_PASSWORD")
+                .ok()
+                .filter(|p| p.len() >= 8);
             let password = match password {
                 Some(p) => p,
                 None => random_hex(18),
@@ -158,7 +173,6 @@ impl Auth {
                 write_private(&bootstrap_path, &password)?;
                 bootstrap = Some(Bootstrap {
                     username,
-                    password,
                     path: bootstrap_path,
                 });
             }
@@ -168,10 +182,11 @@ impl Auth {
             Auth {
                 path,
                 audit_path,
+                reset_path,
                 store: Mutex::new(store),
                 sessions: Mutex::new(HashMap::new()),
                 attempts: Mutex::new(HashMap::new()),
-                bootstrap_path: bootstrap.as_ref().map(|b| b.path.clone()),
+                reset_lock: Mutex::new(()),
             },
             bootstrap,
         ))
@@ -219,6 +234,87 @@ impl Auth {
         }
     }
 
+    /// Invalidate every password session for one administrator.
+    pub fn logout_all(&self, actor: &Session) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, session| session.username != actor.username);
+        let removed = before - sessions.len();
+        drop(sessions);
+        self.audit(
+            &actor.username,
+            "logout_all",
+            &format!("{removed} session(s) closed"),
+        );
+        removed
+    }
+
+    /// Create a short-lived one-time reset token. The command runs without
+    /// the daemon, so the token is written where the HTTP handler can read it.
+    pub fn issue_reset_token(
+        config_path: &Path,
+        username: &str,
+    ) -> Result<(String, PathBuf), String> {
+        let auth_path = config_path.with_extension("auth.json");
+        let bytes =
+            fs::read(&auth_path).map_err(|e| format!("read {}: {e}", auth_path.display()))?;
+        let store: Store = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse {}: {e}", auth_path.display()))?;
+        if !store
+            .admins
+            .iter()
+            .any(|a| a.username == username && a.enabled)
+        {
+            return Err(format!("unknown or disabled administrator '{username}'"));
+        }
+        let token = random_hex(24);
+        let reset = ResetToken {
+            username: username.to_string(),
+            hash: hash_secret(&token)?,
+            expires: now() + RESET_SECONDS,
+        };
+        let reset_path = config_path.with_extension("reset.json");
+        write_private_json(&reset_path, &reset)?;
+        Ok((token, reset_path))
+    }
+
+    /// Consume a reset token and replace one administrator password.
+    pub fn reset_password(&self, token: &str, new_password: &str) -> Result<String, String> {
+        if new_password.len() < 8 {
+            return Err("password must be at least 8 characters".to_string());
+        }
+        let _reset = self.reset_lock.lock().unwrap();
+        let bytes =
+            fs::read(&self.reset_path).map_err(|_| "invalid or expired reset token".to_string())?;
+        let reset: ResetToken =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid reset token".to_string())?;
+        if reset.expires <= now() {
+            let _ = fs::remove_file(&self.reset_path);
+            return Err("reset token has expired".to_string());
+        }
+        verify_secret(&reset.hash, token)?;
+        let mut store = self.store.lock().unwrap();
+        let admin = store
+            .admins
+            .iter_mut()
+            .find(|a| a.username == reset.username)
+            .ok_or_else(|| "unknown administrator".to_string())?;
+        admin.password_hash = hash_secret(new_password)?;
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, session| session.username != reset.username);
+        write_private_json(&self.path, &*store)?;
+        drop(store);
+        let _ = fs::remove_file(&self.reset_path);
+        self.audit(
+            &reset.username,
+            "password.reset",
+            "password reset with one-time token",
+        );
+        Ok(reset.username)
+    }
+
     pub fn session(&self, token: &str) -> Option<Session> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get(token)?.clone();
@@ -233,6 +329,9 @@ impl Auth {
         let store = self.store.lock().unwrap();
         for admin in store.admins.iter().filter(|a| a.enabled) {
             for stored in &admin.api_tokens {
+                if stored.expires.map(|e| e <= now()).unwrap_or(false) {
+                    continue;
+                }
                 if verify_secret(&stored.hash, token).is_ok() {
                     return Some(Session {
                         username: admin.username.clone(),
@@ -252,9 +351,15 @@ impl Auth {
         username: &str,
         name: &str,
         role: Role,
+        expires_in_days: Option<u64>,
     ) -> Result<String, String> {
         if !actor.role.can_admin() {
             return Err("super administrator role required".to_string());
+        }
+        let days = expires_in_days.unwrap_or(TOKEN_DEFAULT_SECONDS / 86_400);
+        let seconds = days * 86_400;
+        if seconds == 0 || seconds > TOKEN_MAX_SECONDS {
+            return Err("token expiry must be between 1 and 365 days".to_string());
         }
         let plain = format!("vela_{}", random_hex(32));
         let hash = hash_secret(&plain)?;
@@ -270,6 +375,7 @@ impl Auth {
             hash,
             role,
             created: now(),
+            expires: Some(now() + seconds),
         });
         write_private_json(&self.path, &*store)?;
         drop(store);
@@ -368,11 +474,7 @@ impl Auth {
         Ok(())
     }
 
-    pub fn list_tokens(
-        &self,
-        actor: &Session,
-        username: &str,
-    ) -> Result<Vec<TokenView>, String> {
+    pub fn list_tokens(&self, actor: &Session, username: &str) -> Result<Vec<TokenView>, String> {
         if actor.username != username && !actor.role.can_admin() {
             return Err("super administrator role required".to_string());
         }
@@ -390,6 +492,7 @@ impl Auth {
                 name: t.name.clone(),
                 role: t.role,
                 created: t.created,
+                expires: t.expires,
             })
             .collect())
     }
@@ -511,6 +614,7 @@ pub struct TokenView {
     pub name: String,
     pub role: Role,
     pub created: u64,
+    pub expires: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -565,7 +669,7 @@ fn write_private(path: &Path, text: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
-fn write_private_json(path: &Path, store: &Store) -> Result<(), String> {
+fn write_private_json<T: Serialize>(path: &Path, store: &T) -> Result<(), String> {
     let text = serde_json::to_string_pretty(store).map_err(|e| format!("serialize admins: {e}"))?;
     write_private(path, &text)
 }
@@ -594,6 +698,48 @@ mod tests {
     }
 
     #[test]
+    fn reset_token_changes_password_once() {
+        let dir = std::env::temp_dir().join(format!("vela-reset-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("firewall.conf");
+        fs::write(&path, "system hostname test\n").unwrap();
+        let (auth, boot) = Auth::load(&path).unwrap();
+        let boot = boot.unwrap();
+        let old_password = fs::read_to_string(&boot.path).unwrap();
+        let (token, _) = Auth::issue_reset_token(&path, &boot.username).unwrap();
+        assert!(auth.reset_password(&token, "new-password-1").is_ok());
+        assert!(auth.login(&boot.username, &old_password).is_err());
+        assert!(auth.login(&boot.username, "new-password-1").is_ok());
+        assert!(auth.reset_password(&token, "new-password-2").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_tokens_expire_and_are_listed() {
+        let dir = std::env::temp_dir().join(format!("vela-token-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("firewall.conf");
+        fs::write(&path, "system hostname test\n").unwrap();
+        let (auth, boot) = Auth::load(&path).unwrap();
+        let boot = boot.unwrap();
+        let password = fs::read_to_string(&boot.path).unwrap();
+        let (_, session) = auth.login(&boot.username, &password).unwrap();
+        let token = auth
+            .create_api_token(&session, &boot.username, "test", Role::Auditor, Some(1))
+            .unwrap();
+        assert!(auth.authenticate_api_token(&token).is_some());
+        let listed = auth.list_tokens(&session, &boot.username).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].expires.unwrap() > now());
+        assert!(auth
+            .create_api_token(&session, &boot.username, "bad", Role::Auditor, Some(0))
+            .is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rejects_bad_credentials_and_unknown_admins() {
         let dir = std::env::temp_dir().join(format!("vela-auth-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -603,7 +749,8 @@ mod tests {
         let (auth, boot) = Auth::load(&path).unwrap();
         let boot = boot.unwrap();
         assert!(auth.login(&boot.username, "not-the-password").is_err());
-        let (token, session) = auth.login(&boot.username, &boot.password).unwrap();
+        let password = fs::read_to_string(&boot.path).unwrap();
+        let (token, session) = auth.login(&boot.username, &password).unwrap();
         assert_eq!(session.role, Role::SuperAdmin);
         assert!(auth.session(&token).is_some());
         auth.logout(&token);

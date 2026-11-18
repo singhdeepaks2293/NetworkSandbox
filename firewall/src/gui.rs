@@ -2,33 +2,150 @@
 
 use crate::auth::{Auth, Role, Session};
 use crate::dataplane::Engine;
+use rustls::{ServerConnection, StreamOwned};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::{IpAddr, TcpListener};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_BODY: usize = 2 * 1024 * 1024;
 const PRODUCT: &str = "VELA NGFW";
 const VERSION: &str = "0.1.0";
+const MAX_LINE: usize = 8 * 1024;
+const MAX_HEADERS: usize = 100;
+
+#[derive(Clone, Copy)]
+struct Limits {
+    max_body: usize,
+    rate: u32,
+    burst: u32,
+}
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+#[derive(Default)]
+struct Limiter {
+    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+}
+
+impl Limiter {
+    fn allow(&self, ip: IpAddr, rate: u32, burst: u32) -> bool {
+        if rate == 0 {
+            return true;
+        }
+        let mut buckets = self.buckets.lock().unwrap();
+        let now = Instant::now();
+        let burst = burst.max(1) as f64;
+        let bucket = buckets.entry(ip).or_insert(Bucket {
+            tokens: burst,
+            last: now,
+        });
+        let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * rate as f64 / 60.0).min(burst);
+        bucket.last = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prune(&self) {
+        let mut buckets = self.buckets.lock().unwrap();
+        if buckets.len() > 4096 {
+            let cutoff = Instant::now() - Duration::from_secs(600);
+            buckets.retain(|_, bucket| bucket.last >= cutoff);
+        }
+    }
+}
 
 pub fn serve(engine: Arc<Engine>, auth: Arc<Auth>) {
-    let port = engine.cfg.read().unwrap().settings.gui_port;
-    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+    let (bind, port, tls, limits, hostname, config_path) = {
+        let cfg = engine.cfg.read().unwrap();
+        (
+            cfg.settings.gui_bind,
+            cfg.settings.gui_port,
+            cfg.settings.tls,
+            Limits {
+                max_body: cfg.settings.max_body,
+                rate: cfg.settings.api_rate,
+                burst: cfg.settings.api_burst,
+            },
+            cfg.settings.hostname.clone(),
+            engine.config_path.clone(),
+        )
+    };
+    let tls_config = if tls {
+        match crate::tls::server_config(
+            config_path.as_deref(),
+            &engine.cfg.read().unwrap().settings,
+            &hostname,
+        ) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                eprintln!("gui: TLS disabled: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let listener = match TcpListener::bind((bind, port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("gui: cannot listen on port {port}: {e}");
+            eprintln!("gui: cannot listen on {bind}:{port}: {e}");
             return;
         }
     };
-    println!("gui: listening on http://0.0.0.0:{port}");
+    let scheme = if tls { "https" } else { "http" };
+    println!("gui: listening on {scheme}://{bind}:{port}");
+    let limiter = Arc::new(Limiter::default());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let engine = engine.clone();
                 let auth = auth.clone();
-                std::thread::spawn(move || handle(&engine, &auth, stream));
+                let limiter = limiter.clone();
+                let tls_config = tls_config.clone();
+                std::thread::spawn(move || {
+                    let peer = stream
+                        .peer_addr()
+                        .map(|a| a.ip())
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+                    limiter.prune();
+                    if !limiter.allow(peer, limits.rate, limits.burst) {
+                        if !tls {
+                            let mut stream = stream;
+                            let _ = send(
+                                &mut stream,
+                                Response::error(429, "request rate limit exceeded"),
+                                tls,
+                            );
+                        }
+                        return;
+                    }
+                    match tls_config {
+                        Some(config) => {
+                            let connection = match ServerConnection::new(config) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!("gui: TLS setup: {e}");
+                                    return;
+                                }
+                            };
+                            let stream = StreamOwned::new(connection, stream);
+                            handle(&engine, &auth, stream, tls, limits);
+                        }
+                        None => handle(&engine, &auth, stream, tls, limits),
+                    }
+                });
             }
             Err(e) => eprintln!("gui: accept: {e}"),
         }
@@ -87,44 +204,120 @@ struct Authn {
     via_cookie: bool,
 }
 
-fn handle(engine: &Engine, auth: &Auth, mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
+fn handle<S: Read + Write>(engine: &Engine, auth: &Auth, stream: S, tls: bool, limits: Limits) {
+    let mut reader = BufReader::new(stream);
+    let Some(request_line) = read_limited(&mut reader, MAX_LINE) else {
+        return;
+    };
+    if request_line.len() > MAX_LINE {
+        let _ = send(
+            reader.get_mut(),
+            Response::error(414, "request line too long"),
+            tls,
+        );
         return;
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
+    let version = parts.next().unwrap_or("");
+    if method.is_empty() || target.is_empty() {
+        let _ = send(
+            reader.get_mut(),
+            Response::error(400, "malformed request line"),
+            tls,
+        );
+        return;
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        let _ = send(
+            reader.get_mut(),
+            Response::error(505, "HTTP version not supported"),
+            tls,
+        );
+        return;
+    }
     let (path, query) = split_target(&target);
     let mut headers = HashMap::new();
     let mut length = 0usize;
-    loop {
-        let mut header = String::new();
-        match reader.read_line(&mut header) {
-            Ok(0) => break,
-            Ok(_) => {
-                if header == "\r\n" || header == "\n" {
-                    break;
-                }
-                if let Some((key, value)) = header.split_once(':') {
-                    let key = key.trim().to_ascii_lowercase();
-                    let value = value.trim().to_string();
-                    if key == "content-length" {
-                        length = value.parse().unwrap_or(0);
-                    }
-                    headers.insert(key, value);
-                }
-            }
-            Err(_) => return,
+    for _ in 0..=MAX_HEADERS {
+        let Some(header) = read_limited(&mut reader, MAX_LINE) else {
+            return;
+        };
+        if header.len() > MAX_LINE {
+            let _ = send(
+                reader.get_mut(),
+                Response::error(431, "header too large"),
+                tls,
+            );
+            return;
         }
+        if header == "\r\n" || header == "\n" {
+            break;
+        }
+        let Some((key, value)) = header.split_once(':') else {
+            let _ = send(
+                reader.get_mut(),
+                Response::error(400, "malformed header"),
+                tls,
+            );
+            return;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            let _ = send(
+                reader.get_mut(),
+                Response::error(400, "malformed header name"),
+                tls,
+            );
+            return;
+        }
+        if key == "content-length" {
+            if headers.contains_key("content-length") {
+                let _ = send(
+                    reader.get_mut(),
+                    Response::error(400, "duplicate content-length"),
+                    tls,
+                );
+                return;
+            }
+            length = match value.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    let _ = send(
+                        reader.get_mut(),
+                        Response::error(400, "invalid content-length"),
+                        tls,
+                    );
+                    return;
+                }
+            };
+        }
+        if key == "transfer-encoding" {
+            let _ = send(
+                reader.get_mut(),
+                Response::error(400, "transfer-encoding is not supported"),
+                tls,
+            );
+            return;
+        }
+        headers.insert(key, value);
     }
-    if length > MAX_BODY {
-        let _ = send(&mut stream, Response::error(413, "request body too large"));
+    if headers.len() >= MAX_HEADERS {
+        let _ = send(
+            reader.get_mut(),
+            Response::error(431, "too many headers"),
+            tls,
+        );
+        return;
+    }
+    if length > limits.max_body {
+        let _ = send(
+            reader.get_mut(),
+            Response::error(413, "request body too large"),
+            tls,
+        );
         return;
     }
     let mut body = vec![0u8; length];
@@ -138,8 +331,21 @@ fn handle(engine: &Engine, auth: &Auth, mut stream: TcpStream) {
         headers,
         body,
     };
-    let response = route(engine, auth, &request);
-    let _ = send(&mut stream, response);
+    let response = route(engine, auth, &request, tls);
+    let _ = send(reader.get_mut(), response, tls);
+}
+
+fn read_limited<R: BufRead>(reader: &mut R, limit: usize) -> Option<String> {
+    let mut line = String::new();
+    let read = reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_line(&mut line)
+        .ok()?;
+    if read == 0 {
+        return None;
+    }
+    Some(line)
 }
 
 fn split_target(target: &str) -> (String, HashMap<String, String>) {
@@ -173,7 +379,13 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
+fn route(engine: &Engine, auth: &Auth, req: &Request, tls: bool) -> Response {
+    if req.path.starts_with("/api/") && !origin_allowed(req, tls) {
+        return Response::error(403, "cross-origin request rejected");
+    }
+    if req.method == "OPTIONS" {
+        return Response::new(204, "text/plain", String::new());
+    }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
         return Response::html(INDEX_HTML);
     }
@@ -184,7 +396,10 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
         );
     }
     if req.path == "/api/v1/auth/login" && req.method == "POST" {
-        return login(auth, req);
+        return login(auth, req, tls);
+    }
+    if req.path == "/api/v1/auth/password-reset" && req.method == "POST" {
+        return reset_password(auth, req);
     }
     let Some(authn) = authenticate(auth, req) else {
         return Response::error(401, "authentication required").header(
@@ -193,7 +408,11 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
         );
     };
     if is_write(&req.method) && authn.via_cookie {
-        let supplied = req.headers.get("x-vela-csrf").map(String::as_str).unwrap_or("");
+        let supplied = req
+            .headers
+            .get("x-vela-csrf")
+            .map(String::as_str)
+            .unwrap_or("");
         if supplied.is_empty() || supplied != authn.session.csrf {
             return Response::error(403, "missing or invalid CSRF token");
         }
@@ -213,10 +432,13 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
             if let Some(token) = session_cookie(req) {
                 auth.logout(&token);
             }
-            Response::json(200, json!({"ok": true})).header(
-                "Set-Cookie",
-                "vela_session=deleted; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
-            )
+            Response::json(200, json!({"ok": true}))
+                .header("Set-Cookie", &session_cookie_header("deleted", 0, tls))
+        }
+        ("POST", "/api/v1/auth/logout-all") => {
+            let count = auth.logout_all(&authn.session);
+            Response::json(200, json!({"ok": true, "sessions_closed": count}))
+                .header("Set-Cookie", &session_cookie_header("deleted", 0, tls))
         }
         ("POST", "/api/v1/auth/password") => change_password(auth, &authn.session, req),
         ("GET", "/api/state" | "/api/v1/state" | "/api/v1/system") => {
@@ -300,15 +522,16 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
                 Err(e) => Response::error(409, &e),
             }
         }
-        ("GET", "/api/v1/configuration/backup") => {
-            Response::json(200, json!({
+        ("GET", "/api/v1/configuration/backup") => Response::json(
+            200,
+            json!({
                 "product": PRODUCT,
                 "version": VERSION,
                 "exported": now(),
                 "revision": engine.config_revision(),
                 "config": engine.running_text(),
-            }))
-        }
+            }),
+        ),
         ("POST", "/api/v1/configuration/restore") => {
             if !authn.session.role.can_write() {
                 return Response::error(403, "role is read-only for configuration");
@@ -320,10 +543,16 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    match engine.stage_config(&text).and_then(|_| engine.commit_candidate()) {
+                    match engine
+                        .stage_config(&text)
+                        .and_then(|_| engine.commit_candidate())
+                    {
                         Ok(()) => {
                             auth.audit(&authn.session.username, "config.restore", "");
-                            Response::json(200, json!({"ok": true, "revision": engine.config_revision()}))
+                            Response::json(
+                                200,
+                                json!({"ok": true, "revision": engine.config_revision()}),
+                            )
                         }
                         Err(e) => Response::error(422, &e),
                     }
@@ -343,10 +572,16 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
         }
         ("GET", "/api/v1/zones") => Response::json(200, json!({"zones": zones_value(engine)})),
         ("GET", "/api/v1/routes") => Response::json(200, json!({"routes": routes_value(engine)})),
-        ("GET", "/api/v1/policies") => Response::json(200, json!({"policies": policies_value(engine)})),
+        ("GET", "/api/v1/policies") => {
+            Response::json(200, json!({"policies": policies_value(engine)}))
+        }
         ("GET", "/api/v1/nat") => Response::json(200, json!({"rules": nat_value(engine)})),
-        ("GET", "/api/v1/objects") => Response::json(200, json!({"objects": objects_value(engine)})),
-        ("GET", "/api/v1/security") => Response::json(200, json!({"security": security_value(engine)})),
+        ("GET", "/api/v1/objects") => {
+            Response::json(200, json!({"objects": objects_value(engine)}))
+        }
+        ("GET", "/api/v1/security") => {
+            Response::json(200, json!({"security": security_value(engine)}))
+        }
         ("GET", "/api/v1/monitoring") => {
             Response::json(200, json!({"monitoring": monitoring_value(engine)}))
         }
@@ -365,8 +600,15 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
         },
         ("POST", "/api/v1/administrators") => add_admin(auth, &authn.session, req),
         ("GET", "/api/v1/audit") => {
-            let limit = req.query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
-            Response::json(200, json!({"events": auth.audit_records(&authn.session, limit)}))
+            let limit = req
+                .query
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200);
+            Response::json(
+                200,
+                json!({"events": auth.audit_records(&authn.session, limit)}),
+            )
         }
         _ if path.starts_with("/api/v1/administrators/") => {
             admin_subroute(auth, &authn.session, req, path)
@@ -375,7 +617,34 @@ fn route(engine: &Engine, auth: &Auth, req: &Request) -> Response {
     }
 }
 
-fn login(auth: &Auth, req: &Request) -> Response {
+fn origin_allowed(req: &Request, tls: bool) -> bool {
+    let Some(origin) = req.headers.get("origin") else {
+        return true;
+    };
+    if origin == "null" {
+        return false;
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let expected = if tls { "https" } else { "http" };
+    scheme == expected
+        && req
+            .headers
+            .get("host")
+            .map(|host| host == authority)
+            .unwrap_or(false)
+}
+
+fn session_cookie_header(token: &str, max_age: u64, tls: bool) -> String {
+    let secure = tls || secure_cookie();
+    format!(
+        "vela_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+fn login(auth: &Auth, req: &Request, tls: bool) -> Response {
     let value: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(_) => return Response::error(400, "expected JSON credentials"),
@@ -384,10 +653,7 @@ fn login(auth: &Auth, req: &Request) -> Response {
     let password = value.get("password").and_then(Value::as_str).unwrap_or("");
     match auth.login(username, password) {
         Ok((token, session)) => {
-            let cookie = format!(
-                "vela_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800{}",
-                if secure_cookie() { "; Secure" } else { "" }
-            );
+            let cookie = session_cookie_header(&token, 28_800, tls);
             Response::json(
                 200,
                 json!({
@@ -404,6 +670,19 @@ fn login(auth: &Auth, req: &Request) -> Response {
             let status = if e.starts_with("too many") { 429 } else { 401 };
             Response::error(status, &e)
         }
+    }
+}
+
+fn reset_password(auth: &Auth, req: &Request) -> Response {
+    let value: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(_) => return Response::error(400, "expected JSON object"),
+    };
+    let token = value.get("token").and_then(Value::as_str).unwrap_or("");
+    let password = value.get("password").and_then(Value::as_str).unwrap_or("");
+    match auth.reset_password(token, password) {
+        Ok(username) => Response::json(200, json!({"ok": true, "username": username})),
+        Err(e) => Response::error(400, &e),
     }
 }
 
@@ -445,6 +724,10 @@ fn admin_subroute(auth: &Auth, session: &Session, req: &Request, path: &str) -> 
     let action = parts.next();
     let id = parts.next();
     match (req.method.as_str(), action, id) {
+        ("GET", Some("tokens"), None) => match auth.list_tokens(session, username) {
+            Ok(tokens) => Response::json(200, json!({"tokens": tokens})),
+            Err(e) => Response::error(403, &e),
+        },
         ("DELETE", None, None) => match auth.delete_admin(session, username) {
             Ok(()) => Response::json(200, json!({"ok": true})),
             Err(e) => Response::error(400, &e),
@@ -460,17 +743,16 @@ fn admin_subroute(auth: &Auth, session: &Session, req: &Request, path: &str) -> 
                 .and_then(Value::as_str)
                 .and_then(Role::parse)
                 .unwrap_or(session.role);
-            match auth.create_api_token(session, username, name, role) {
+            let days = value.get("expires_days").and_then(Value::as_u64);
+            match auth.create_api_token(session, username, name, role, days) {
                 Ok(token) => Response::json(201, json!({"ok": true, "token": token})),
                 Err(e) => Response::error(400, &e),
             }
         }
-        ("DELETE", Some("tokens"), Some(id)) => {
-            match auth.revoke_token(session, username, id) {
-                Ok(()) => Response::json(200, json!({"ok": true})),
-                Err(e) => Response::error(400, &e),
-            }
-        }
+        ("DELETE", Some("tokens"), Some(id)) => match auth.revoke_token(session, username, id) {
+            Ok(()) => Response::json(200, json!({"ok": true})),
+            Err(e) => Response::error(400, &e),
+        },
         _ => Response::error(404, "not found"),
     }
 }
@@ -479,13 +761,19 @@ fn authenticate(auth: &Auth, req: &Request) -> Option<Authn> {
     if let Some(header) = req.headers.get("authorization") {
         if let Some(token) = header.strip_prefix("Bearer ") {
             if let Some(session) = auth.authenticate_api_token(token.trim()) {
-                return Some(Authn { session, via_cookie: false });
+                return Some(Authn {
+                    session,
+                    via_cookie: false,
+                });
             }
         }
     }
     if let Some(token) = session_cookie(req) {
         if let Some(session) = auth.session(&token) {
-            return Some(Authn { session, via_cookie: true });
+            return Some(Authn {
+                session,
+                via_cookie: true,
+            });
         }
     }
     None
@@ -500,7 +788,9 @@ fn session_cookie(req: &Request) -> Option<String> {
 }
 
 fn secure_cookie() -> bool {
-    std::env::var("VELA_SECURE_COOKIE").map(|v| v == "1").unwrap_or(false)
+    std::env::var("VELA_SECURE_COOKIE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn is_write(method: &str) -> bool {
@@ -517,7 +807,7 @@ fn request_config_text(req: &Request) -> String {
     body
 }
 
-fn send(stream: &mut TcpStream, mut response: Response) -> std::io::Result<()> {
+fn send<S: Write>(stream: &mut S, mut response: Response, tls: bool) -> std::io::Result<()> {
     let reason = match response.status {
         200 => "OK",
         201 => "Created",
@@ -529,16 +819,22 @@ fn send(stream: &mut TcpStream, mut response: Response) -> std::io::Result<()> {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        414 => "URI Too Long",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        505 => "HTTP Version Not Supported",
         _ => "Error",
     };
     let mut head = format!(
         "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         response.status, response.content_type, response.body.len()
     );
-    head.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\n");
+    head.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\n");
+    if tls {
+        head.push_str("Strict-Transport-Security: max-age=31536000\r\n");
+    }
     if response.content_type.starts_with("text/html") {
         head.push_str("Content-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'\r\n");
     }
@@ -547,7 +843,8 @@ fn send(stream: &mut TcpStream, mut response: Response) -> std::io::Result<()> {
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
-    stream.write_all(&response.body)
+    stream.write_all(&response.body)?;
+    stream.flush()
 }
 
 fn mac_string(mac: [u8; 6]) -> String {
@@ -632,7 +929,10 @@ fn state_json(engine: &Engine) -> String {
 
 fn sessions_json(engine: &Engine, query: &HashMap<String, String>) -> String {
     let vdom_filter = query.get("vdom").map(String::as_str).unwrap_or("");
-    let text_filter = query.get("q").map(|q| q.to_ascii_lowercase()).unwrap_or_default();
+    let text_filter = query
+        .get("q")
+        .map(|q| q.to_ascii_lowercase())
+        .unwrap_or_default();
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -673,9 +973,7 @@ fn sessions_json(engine: &Engine, query: &HashMap<String, String>) -> String {
             "shaper": session.shaper,
             "ttl": session.expires.saturating_duration_since(now).as_secs(),
         });
-        if !text_filter.is_empty()
-            && !row.to_string().to_ascii_lowercase().contains(&text_filter)
-        {
+        if !text_filter.is_empty() && !row.to_string().to_ascii_lowercase().contains(&text_filter) {
             continue;
         }
         rows.push(row);
@@ -733,10 +1031,18 @@ fn monitoring_value(engine: &Engine) -> Value {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("MemTotal:") {
-                mem_total = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                mem_total = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(0);
             }
             if let Some(v) = line.strip_prefix("MemAvailable:") {
-                mem_available = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                mem_available = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(0);
             }
         }
     }
@@ -791,49 +1097,69 @@ fn zones_value(engine: &Engine) -> Value {
 
 fn routes_value(engine: &Engine) -> Value {
     let cfg = engine.cfg.read().unwrap();
-    Value::Array(cfg.routes.iter().map(|r| json!({
-        "vdom": r.vdom,
-        "interface": r.interface,
-        "gateway": r.via.map(|v| v.to_string()),
-    })).collect())
+    Value::Array(
+        cfg.routes
+            .iter()
+            .map(|r| {
+                json!({
+                    "vdom": r.vdom,
+                    "interface": r.interface,
+                    "gateway": r.via.map(|v| v.to_string()),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn policies_value(engine: &Engine) -> Value {
     let cfg = engine.cfg.read().unwrap();
-    Value::Array(cfg.policies.iter().map(|p| json!({
-        "id": p.id,
-        "vdom": p.vdom,
-        "src_zone": p.src_zone,
-        "dst_zone": p.dst_zone,
-        "src": p.src.to_string(),
-        "dst": p.dst.to_string(),
-        "proto": p.proto.to_string(),
-        "dst_port": p.dst_port,
-        "service": p.service,
-        "action": p.action.as_str(),
-                "enabled": p.enabled,
-                "name": p.name,
-        "nat": p.nat,
-        "app": p.app,
-        "url": p.url,
-        "ips": p.ips,
-        "av": p.av,
-        "shaper": p.shaper,
-        "logging": p.log,
-    })).collect())
+    Value::Array(
+        cfg.policies
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "vdom": p.vdom,
+                    "src_zone": p.src_zone,
+                    "dst_zone": p.dst_zone,
+                    "src": p.src.to_string(),
+                    "dst": p.dst.to_string(),
+                    "proto": p.proto.to_string(),
+                    "dst_port": p.dst_port,
+                    "service": p.service,
+                    "action": p.action.as_str(),
+                            "enabled": p.enabled,
+                            "name": p.name,
+                    "nat": p.nat,
+                    "app": p.app,
+                    "url": p.url,
+                    "ips": p.ips,
+                    "av": p.av,
+                    "shaper": p.shaper,
+                    "logging": p.log,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn nat_value(engine: &Engine) -> Value {
     let cfg = engine.cfg.read().unwrap();
-    let rules: Vec<Value> = cfg.dnat.iter().map(|d| json!({
-        "id": d.id,
-        "vdom": d.vdom,
-        "proto": d.proto.to_string(),
-        "dst": d.dst.to_string(),
-        "dst_port": d.dst_port,
-        "to_ip": d.to_ip.to_string(),
-        "to_port": d.to_port,
-    })).collect();
+    let rules: Vec<Value> = cfg
+        .dnat
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "vdom": d.vdom,
+                "proto": d.proto.to_string(),
+                "dst": d.dst.to_string(),
+                "dst_port": d.dst_port,
+                "to_ip": d.to_ip.to_string(),
+                "to_port": d.to_port,
+            })
+        })
+        .collect();
     Value::Array(rules)
 }
 
@@ -1506,3 +1832,18 @@ $('logout').onclick=doLogout;
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limiter_enforces_burst_and_can_be_disabled() {
+        let limiter = Limiter::default();
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        assert!(limiter.allow(ip, 60, 1));
+        assert!(!limiter.allow(ip, 60, 1));
+        assert!(limiter.allow(ip, 0, 0));
+        assert!(limiter.allow(ip, 0, 0));
+    }
+}

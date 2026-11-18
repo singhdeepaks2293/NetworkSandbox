@@ -15,7 +15,7 @@
 //! ```
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
@@ -294,9 +294,7 @@ impl Action {
             "permit" | "accept" | "allow" => Ok(Action::Permit),
             "deny" | "drop" => Ok(Action::Deny),
             "reject" => Ok(Action::Reject),
-            other => Err(format!(
-                "invalid action '{other}' (permit, deny or reject)"
-            )),
+            other => Err(format!("invalid action '{other}' (permit, deny or reject)")),
         }
     }
 
@@ -368,6 +366,17 @@ pub struct Settings {
     pub hostname: String,
     pub cli_port: u16,
     pub gui_port: u16,
+    /// Management listeners bind here. Loopback is the secure default; a
+    /// container or appliance can opt into a management network explicitly.
+    pub cli_bind: IpAddr,
+    pub gui_bind: IpAddr,
+    /// Serve the web management API over HTTPS.
+    pub tls: bool,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub api_rate: u32,
+    pub api_burst: u32,
+    pub max_body: usize,
     pub tcp_timeout: u64,
     pub udp_timeout: u64,
     pub icmp_timeout: u64,
@@ -377,6 +386,14 @@ pub struct Settings {
     pub max_sessions: usize,
     /// Cap on tracked flows opened by one source address; 0 disables it.
     pub max_sessions_per_ip: usize,
+    /// Largest accepted Ethernet frame. Oversized frames are dropped before
+    /// parsing so a hostile sender cannot force unbounded parser work.
+    pub max_packet_size: usize,
+    /// Upper bound on bytes handed to URL/IPS/AV payload inspection.
+    pub max_inspection_bytes: usize,
+    /// Per-source ingress packet rate and burst; 0 disables the limiter.
+    pub source_rate: u32,
+    pub source_burst: u32,
 }
 
 impl Default for Settings {
@@ -385,6 +402,14 @@ impl Default for Settings {
             hostname: "firewall".to_string(),
             cli_port: 2200,
             gui_port: 8080,
+            cli_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            gui_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tls: true,
+            tls_cert: None,
+            tls_key: None,
+            api_rate: 600,
+            api_burst: 120,
+            max_body: 1024 * 1024,
             tcp_timeout: 300,
             udp_timeout: 30,
             icmp_timeout: 10,
@@ -392,6 +417,10 @@ impl Default for Settings {
             log_json: false,
             max_sessions: 100_000,
             max_sessions_per_ip: 0,
+            max_packet_size: 65_535,
+            max_inspection_bytes: 65_535,
+            source_rate: 0,
+            source_burst: 0,
         }
     }
 }
@@ -469,6 +498,28 @@ impl Config {
             "hostname" => s.hostname = value.to_string(),
             "cli-port" => s.cli_port = value.parse().map_err(|_| "invalid cli-port".to_string())?,
             "gui-port" => s.gui_port = value.parse().map_err(|_| "invalid gui-port".to_string())?,
+            "cli-bind" => {
+                s.cli_bind = value
+                    .parse()
+                    .map_err(|_| "invalid cli-bind address".to_string())?
+            }
+            "gui-bind" => {
+                s.gui_bind = value
+                    .parse()
+                    .map_err(|_| "invalid gui-bind address".to_string())?
+            }
+            "tls" => match value {
+                "on" | "yes" | "true" => s.tls = true,
+                "off" | "no" | "false" => s.tls = false,
+                _ => return Err("system tls expects on or off".to_string()),
+            },
+            "tls-cert" => s.tls_cert = Some(value.to_string()),
+            "tls-key" => s.tls_key = Some(value.to_string()),
+            "api-rate" => s.api_rate = value.parse().map_err(|_| "invalid api-rate".to_string())?,
+            "api-burst" => {
+                s.api_burst = value.parse().map_err(|_| "invalid api-burst".to_string())?
+            }
+            "max-body" => s.max_body = value.parse().map_err(|_| "invalid max-body".to_string())?,
             "conntrack-tcp" => {
                 s.tcp_timeout = value
                     .parse()
@@ -493,6 +544,26 @@ impl Config {
                 s.max_sessions_per_ip = value
                     .parse()
                     .map_err(|_| "invalid max-sessions-per-ip".to_string())?
+            }
+            "max-packet" => {
+                s.max_packet_size = value
+                    .parse()
+                    .map_err(|_| "invalid max-packet".to_string())?
+            }
+            "max-inspection" => {
+                s.max_inspection_bytes = value
+                    .parse()
+                    .map_err(|_| "invalid max-inspection".to_string())?
+            }
+            "source-rate" => {
+                s.source_rate = value
+                    .parse()
+                    .map_err(|_| "invalid source-rate".to_string())?
+            }
+            "source-burst" => {
+                s.source_burst = value
+                    .parse()
+                    .map_err(|_| "invalid source-burst".to_string())?
             }
             "logging" => match value {
                 "on" | "yes" | "true" => s.logging = true,
@@ -876,6 +947,9 @@ impl Config {
                     .map_err(|_| format!("invalid dnat translated port '{}'", words[5]))?,
             )
         };
+        if to_port.is_some() && dst_port.is_none() {
+            return Err("dnat translated port requires a public port".to_string());
+        }
         self.dnat.push(DnatRule {
             id,
             vdom: self.current_vdom.clone(),
@@ -940,6 +1014,27 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        let s = &self.settings;
+        if s.tcp_timeout == 0 || s.udp_timeout == 0 || s.icmp_timeout == 0 {
+            return Err("conntrack timeouts must be greater than zero".to_string());
+        }
+        if s.max_packet_size < 64 || s.max_packet_size > 65_535 {
+            return Err("max-packet must be between 64 and 65535".to_string());
+        }
+        if s.max_inspection_bytes == 0 || s.max_inspection_bytes > 65_535 {
+            return Err("max-inspection must be between 1 and 65535".to_string());
+        }
+        if s.max_body < 1024 || s.max_body > 16 * 1024 * 1024 {
+            return Err("max-body must be between 1024 and 16777216".to_string());
+        }
+        if s.tls_cert.is_some() != s.tls_key.is_some() {
+            return Err("tls-cert and tls-key must be configured together".to_string());
+        }
+        if s.source_rate != 0 && s.source_burst == 0 {
+            return Err(
+                "source-burst must be greater than zero when source-rate is set".to_string(),
+            );
+        }
         for iface in &self.interfaces {
             if !iface
                 .zone
@@ -1201,11 +1296,33 @@ impl Config {
         out.push_str(&format!("system hostname {}\n", s.hostname));
         out.push_str(&format!("system cli-port {}\n", s.cli_port));
         out.push_str(&format!("system gui-port {}\n", s.gui_port));
+        out.push_str(&format!("system cli-bind {}\n", s.cli_bind));
+        out.push_str(&format!("system gui-bind {}\n", s.gui_bind));
+        out.push_str(&format!(
+            "system tls {}\n",
+            if s.tls { "on" } else { "off" }
+        ));
+        if let Some(cert) = &s.tls_cert {
+            out.push_str(&format!("system tls-cert {cert}\n"));
+        }
+        if let Some(key) = &s.tls_key {
+            out.push_str(&format!("system tls-key {key}\n"));
+        }
+        out.push_str(&format!("system api-rate {}\n", s.api_rate));
+        out.push_str(&format!("system api-burst {}\n", s.api_burst));
+        out.push_str(&format!("system max-body {}\n", s.max_body));
         out.push_str(&format!("system max-sessions {}\n", s.max_sessions));
         out.push_str(&format!(
             "system max-sessions-per-ip {}\n",
             s.max_sessions_per_ip
         ));
+        out.push_str(&format!("system max-packet {}\n", s.max_packet_size));
+        out.push_str(&format!(
+            "system max-inspection {}\n",
+            s.max_inspection_bytes
+        ));
+        out.push_str(&format!("system source-rate {}\n", s.source_rate));
+        out.push_str(&format!("system source-burst {}\n", s.source_burst));
         out.push_str(&format!("system conntrack-tcp {}\n", s.tcp_timeout));
         out.push_str(&format!("system conntrack-udp {}\n", s.udp_timeout));
         out.push_str(&format!("system conntrack-icmp {}\n", s.icmp_timeout));
@@ -1467,6 +1584,30 @@ policy 5 lan wan any any tcp 22 deny
         );
         assert_eq!(cfg.policies.len(), 2);
         assert!(cfg.policies[0].nat);
+    }
+
+    #[test]
+    fn management_hardening_settings_parse_and_validate() {
+        let cfg = Config::parse(
+            "system hostname fw\n\
+             system cli-bind 127.0.0.1\n\
+             system gui-bind 127.0.0.1\n\
+             system tls on\n\
+             system max-body 2048\n\
+             system max-packet 9000\n\
+             system max-inspection 1500\n\
+             system source-rate 1000\n\
+             system source-burst 500\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.settings.max_body, 2048);
+        assert_eq!(cfg.settings.max_packet_size, 9000);
+        assert_eq!(cfg.settings.max_inspection_bytes, 1500);
+        assert_eq!(cfg.settings.source_rate, 1000);
+        assert_eq!(cfg.settings.source_burst, 500);
+        assert!(Config::parse("system source-rate 10\n").is_err());
+        assert!(Config::parse("system tls-cert /tmp/a.crt\n").is_err());
+        assert!(Config::parse("system max-packet 1\n").is_err());
     }
 
     const NGFW: &str = "\

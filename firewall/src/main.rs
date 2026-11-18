@@ -5,7 +5,9 @@ mod diff;
 mod gui;
 mod inspect;
 mod model;
+mod nft;
 mod packet;
+mod tls;
 
 use dataplane::{Engine, Sessions, Stats};
 use model::Config;
@@ -23,6 +25,9 @@ fn main() {
         Some("daemon") => daemon(&args[1..]),
         Some("cli") => client(&args[1..]),
         Some("config-check" | "check") => config_check(&args[1..]),
+        Some("nft-apply") => nft_apply(&args[1..]),
+        Some("nft-remove") => nft_remove(&args[1..]),
+        Some("password-reset-token") => password_reset_token(&args[1..]),
         Some("version" | "-V" | "--version") => {
             println!("firewall 0.1.0");
             Ok(())
@@ -48,6 +53,9 @@ usage:\n\
                   [--no-dataplane] [--no-gui] [--no-cli] [--dry-run]\n\
   firewall cli [--host HOST] [--port N] [-c COMMAND]\n\
   firewall config-check --config PATH\n\
+  firewall nft-apply --config PATH\n\
+  firewall nft-remove\n\
+  firewall password-reset-token --config PATH --username NAME\n\
 \n\
 The daemon opens AF_PACKET sockets on every configured interface, forwards\n\
 IPv4 between zones according to the first matching policy, keeps a stateful\n\
@@ -141,11 +149,15 @@ fn daemon(args: &[String]) -> Result<(), String> {
         }
     }
     println!(
-        "cli: tcp/{} gui: http/{} dataplane: {}",
+        "cli: tcp/{} gui: {}/{} dataplane: {}",
         cfg.settings.cli_port,
+        if cfg.settings.tls { "https" } else { "http" },
         cfg.settings.gui_port,
         if no_dataplane { "off" } else { "on" }
     );
+    if cfg.settings.tls {
+        tls::server_config(Some(&path), &cfg.settings, &cfg.settings.hostname)?;
+    }
 
     let cfg = Arc::new(RwLock::new(cfg));
     let stats = Arc::new(Mutex::new(Stats::default()));
@@ -170,7 +182,8 @@ fn daemon(args: &[String]) -> Result<(), String> {
     }
     if !no_cli {
         let engine = engine.clone();
-        std::thread::spawn(move || cli::serve(engine));
+        let auth = auth.clone();
+        std::thread::spawn(move || cli::serve(engine, auth));
     }
     let _auth = auth;
     if !no_dataplane && !dry_run {
@@ -211,6 +224,36 @@ fn client(args: &[String]) -> Result<(), String> {
     cli::run_client(&host, port, command.as_deref()).map_err(|e| format!("{host}:{port}: {e}"))
 }
 
+fn password_reset_token(args: &[String]) -> Result<(), String> {
+    let mut config: Option<String> = None;
+    let mut username: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                config = Some(need(args, i, "--config")?.to_string());
+            }
+            "--username" => {
+                i += 1;
+                username = Some(need(args, i, "--username")?.to_string());
+            }
+            other => return Err(format!("unknown password-reset-token option '{other}'")),
+        }
+        i += 1;
+    }
+    let config = config.ok_or_else(|| {
+        "usage: firewall password-reset-token --config PATH --username NAME".to_string()
+    })?;
+    let username =
+        username.ok_or_else(|| "password-reset-token requires --username".to_string())?;
+    let (token, path) = auth::Auth::issue_reset_token(Path::new(&config), &username)?;
+    println!("reset token for {username}: {token}");
+    println!("valid for 15 minutes; stored in {}", path.display());
+    println!("POST /api/v1/auth/password-reset with {{\"token\":\"...\",\"password\":\"...\"}}");
+    Ok(())
+}
+
 fn config_check(args: &[String]) -> Result<(), String> {
     let Some(path) = args
         .iter()
@@ -236,6 +279,31 @@ fn config_check(args: &[String]) -> Result<(), String> {
             route.via.map(|v| format!(" via {v}")).unwrap_or_default()
         );
     }
+    Ok(())
+}
+
+fn nft_apply(args: &[String]) -> Result<(), String> {
+    let path = match args {
+        [flag, path] if flag == "--config" => PathBuf::from(path),
+        _ => return Err("usage: firewall nft-apply --config PATH".to_string()),
+    };
+    let cfg = load_config(&path)?;
+    let summary = nft::install(&cfg)?;
+    println!(
+        "ok: installed inet {} with {} chain(s) and {} rule(s)",
+        nft::TABLE,
+        summary.chains,
+        summary.rules
+    );
+    Ok(())
+}
+
+fn nft_remove(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: firewall nft-remove".to_string());
+    }
+    nft::uninstall()?;
+    println!("ok: removed inet {}", nft::TABLE);
     Ok(())
 }
 
