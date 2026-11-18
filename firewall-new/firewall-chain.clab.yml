@@ -1,0 +1,75 @@
+name: fw-chain-lab
+
+# pc1 --- sw1 --- fw1 --- fw2 --- sw2 --- pc2
+#
+# Two hosts, two switches and two firewalls in a line. pc1 and pc2 use their
+# local firewall as the default gateway; the firewalls share 10.0.0.0/24.
+#
+#   pc1 192.168.1.10/24 -- sw1 -- fw1 192.168.1.1/10.0.0.1 -- fw2 10.0.0.2/192.168.2.1 -- sw2 -- pc2 192.168.2.10/24
+#
+# Deploy and test:
+#   make image
+#   sudo containerlab deploy -t firewall-chain.clab.yml
+#   ./tests/containerlab-chain.sh
+#   sudo containerlab destroy -t firewall-chain.clab.yml --cleanup
+#
+# The switches default to STP-enabled access ports. tests/containerlab-chain.sh
+# disables STP on both so forwarding is immediate; otherwise wait ~35 s.
+
+topology:
+  nodes:
+    pc1:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - ip addr add 192.168.1.10/24 dev eth1
+        - ip route replace default via 192.168.1.1
+        - ip link set eth1 up
+      cmd: sleep infinity
+
+    sw1:
+      kind: linux
+      # switch-delayed is built by tests/containerlab-chain.sh: a two-second
+      # startup delay avoids switchd's fatal ENETDOWN before containerlab
+      # finishes wiring the veth pair.
+      image: switch-delayed:latest
+      cmd: daemon --ports eth1,eth2 --tcp 2200 --hostname sw1
+
+    fw1:
+      kind: linux
+      image: firewall:latest
+      cmd: daemon --config /etc/firewall/firewall.conf --hostname fw1
+      binds:
+        - examples/chain-fw1.conf:/etc/firewall/firewall.conf:ro
+      sysctls:
+        net.ipv4.ip_forward: 0
+
+    fw2:
+      kind: linux
+      image: firewall:latest
+      cmd: daemon --config /etc/firewall/firewall.conf --hostname fw2
+      binds:
+        - examples/chain-fw2.conf:/etc/firewall/firewall.conf:ro
+      sysctls:
+        net.ipv4.ip_forward: 0
+
+    sw2:
+      kind: linux
+      image: switch-delayed:latest
+      cmd: daemon --ports eth1,eth2 --tcp 2200 --hostname sw2
+
+    pc2:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - ip addr add 192.168.2.10/24 dev eth1
+        - ip route replace default via 192.168.2.1
+        - ip link set eth1 up
+      cmd: sleep infinity
+
+  links:
+    - endpoints: ["pc1:eth1", "sw1:eth1"]
+    - endpoints: ["sw1:eth2", "fw1:eth1"]
+    - endpoints: ["fw1:eth2", "fw2:eth1"]
+    - endpoints: ["fw2:eth2", "sw2:eth1"]
+    - endpoints: ["sw2:eth2", "pc2:eth1"]
