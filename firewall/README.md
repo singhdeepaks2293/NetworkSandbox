@@ -172,6 +172,23 @@ For a lost password run `firewall password-reset-token --config PATH
 --username NAME`, then POST the token and a new password to
 `/api/v1/auth/password-reset`.
 
+## Docker
+
+```sh
+make image                                  # or: docker build -t firewall:latest .
+docker run -d --name fw \
+  --sysctl net.ipv4.ip_forward=0 --sysctl net.ipv6.conf.all.forwarding=0 \
+  -e VELA_ADMIN_PASSWORD='choose-a-password' -p 8443:8080 firewall:latest
+# GUI: https://localhost:8443/   CLI: docker exec -it fw /firewall cli
+```
+
+The two `--sysctl` flags matter: the daemon refuses to start while kernel
+forwarding is on in its namespace (see "Fail-closed startup"), and containers
+can start with it on. For the kernel dataplane use `--cap-add NET_ADMIN
+--sysctl net.ipv4.ip_forward=1` instead. The image is `FROM scratch` (no
+shell, no HTTP client), so health is probed from outside via `/healthz`.
+The build needs Rust 1.89 or newer (`rust-version` in `Cargo.toml`).
+
 ## Web GUI
 
 Open `https://<gui-bind>:<gui-port>/` (loopback by default) and sign in with

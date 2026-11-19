@@ -2,7 +2,7 @@
 :root {
   --bg: #f3f5f8; --panel: #ffffff; --panel-2: #f8fafc; --text: #1b2430; --muted: #5d6b7c; --line: #dde3ea;
   --nav: #13233a; --nav-2: #1b3150; --nav-text: #c9d6e6; --nav-active: #ffffff;
-  --accent: #1f6feb; --accent-2: #1557c0; --ok: #12805c; --ok-bg: #e3f5ee; --bad: #c0362c; --bad-bg: #fbe9e7;
+  --accent: #1f6feb; --accent-2: #1557c0; --btn: #1f6feb; --btn-2: #1557c0; --ok: #12805c; --ok-bg: #e3f5ee; --bad: #c0362c; --bad-bg: #fbe9e7;
   --warn: #a15c00; --warn-bg: #fff3dd; --info-bg: #e8f0fd; --chip: #eef2f6; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 4px 16px rgba(16,24,40,.06);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color-scheme: light;
@@ -12,6 +12,8 @@
     --bg: #0f1620; --panel: #16202c; --panel-2: #1b2735; --text: #e3eaf2; --muted: #93a3b6; --line: #2a3747;
     --nav: #0a111a; --nav-2: #142132; --nav-text: #a9b9cc; --chip: #223142; --ok-bg: #123626; --bad-bg: #3d1a17;
     --warn-bg: #3a2a10; --info-bg: #15294a; --shadow: none; color-scheme: dark;
+    /* Light-mode text tones are unreadable on dark tints; lift them. */
+    --ok: #4cc38a; --bad: #ff8a80; --warn: #e3a33b; --accent: #58a6ff; --accent-2: #3d8fe8;
   }
 }
 * { box-sizing: border-box; }
@@ -75,6 +77,8 @@ th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--lin
 th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--panel-2); position: sticky; top: 0; z-index: 1; white-space: nowrap; }
 tbody tr:hover { background: var(--panel-2); }
 tr.disabled td { opacity: .55; }
+tr.deleted td { opacity: .6; }
+tr.deleted .struck { text-decoration: line-through; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.actions { white-space: nowrap; text-align: right; }
 .empty { padding: 28px; text-align: center; color: var(--muted); }
@@ -85,8 +89,8 @@ td.actions { white-space: nowrap; text-align: right; }
 /* Controls */
 button, .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 6px 12px; border-radius: 7px; cursor: pointer; }
 button:hover { border-color: var(--accent); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover { background: var(--accent-2); }
+button.primary { background: var(--btn); border-color: var(--btn); color: #fff; }
+button.primary:hover { background: var(--btn-2); }
 button.danger { color: var(--bad); }
 button.danger.solid { background: var(--bad); border-color: var(--bad); color: #fff; }
 button.small { padding: 3px 8px; font-size: 12.5px; }
@@ -115,7 +119,8 @@ dialog::backdrop { background: rgba(10,17,26,.55); }
 .modal-head { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--line); font-weight: 650; font-size: 16px; }
 .modal-head .spacer { flex: 1; }
 .modal-body { padding: 16px 18px; overflow: auto; max-height: calc(90vh - 120px); }
-.modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
+.modal-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
+.modal-foot .hint { flex: 1 1 260px; align-self: center; color: var(--muted); font-size: 12.5px; }
 
 /* Diff */
 .diff { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; max-height: 50vh; white-space: pre; }

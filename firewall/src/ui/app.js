@@ -65,7 +65,13 @@
   }
 
   /* --------------------------------------------------------- config model */
-  async function loadModel() { S.model = await api('GET', '/api/v1/configuration/model'); renderTop(); }
+  async function loadModel() {
+    S.model = await api('GET', '/api/v1/configuration/model');
+    // With a candidate staged, the running configuration is needed to mark
+    // what the candidate adds, changes or deletes.
+    S.running = S.model.staged ? await api('GET', '/api/v1/configuration/model?source=running') : S.model;
+    renderTop();
+  }
   async function loadSystem() { try { S.system = await api('GET', '/api/v1/system'); renderTop(); } catch (_) { /* shown by the pill */ } }
 
   function section(scope) {
@@ -77,6 +83,27 @@
     const out = section(k.scope).objects.filter((o) => o.kind === kind).map((o) => ({ key: o.key, lines: o.lines, v: k.parse(o.lines) }));
     return k.sort ? out.sort((a, b) => k.sort(a.v, b.v)) : out;
   }
+  function runningObjects(kind) {
+    const k = K[kind];
+    const want = k.scope === 'global' ? null : S.vdom;
+    const sec = ((S.running || S.model).sections.find((x) => x.vdom === want)) || { objects: [] };
+    return sec.objects.filter((o) => o.kind === kind);
+  }
+  // 'new' | 'changed' | null for an object in the candidate.
+  function changeOf(kind, obj) {
+    if (!S.model.staged) return null;
+    const before = runningObjects(kind).find((o) => o.key === obj.key);
+    if (!before) return 'new';
+    return before.lines.join('\n') === obj.lines.join('\n') ? null : 'changed';
+  }
+  // Objects the candidate deletes.
+  function deletedObjects(kind) {
+    if (!S.model.staged) return [];
+    const now = new Set(objects(kind).map((o) => o.key));
+    return runningObjects(kind).filter((o) => !now.has(o.key)).map((o) => ({ key: o.key, lines: o.lines, v: K[kind].parse(o.lines) }));
+  }
+  const changeChip = (c) => (c === 'new' ? chip('new in candidate', 'info') : c === 'changed' ? chip('changed in candidate', 'warn') : null);
+
   const ctx = {
     names: (kind) => [''].concat(objects(kind).map((o) => o.v.name)),
     interfaces: () => S.model.interfaces.filter((i) => i.vdom === S.vdom && !i.tunnel).map((i) => i.name),
@@ -166,7 +193,8 @@
       try { await submitEdits(editsFor); dlg.close(); render(); } catch (e) { err.hidden = false; err.textContent = editError(e); save.disabled = false; }
     } }, 'Save to candidate');
     const dlg = modal(`${verb} ${k.label}${obj && !opts.clone ? ` — ${obj.key}` : ''}`, [datalists(), form],
-      [h('button', { onclick: () => dlg.close() }, 'Cancel'), canWrite() ? save : null]);
+      [canWrite() ? h('span', { class: 'hint' }, 'Saving adds this change to the candidate. The server validates it with the same parser as the CLI.') : null,
+        h('button', { onclick: () => dlg.close() }, 'Cancel'), canWrite() ? save : null]);
     const first = $('input:not([readonly]):not([type=checkbox]), select, textarea', dlg);
     if (first) first.focus();
   }
@@ -182,15 +210,21 @@
       clear(tbody);
       const shown = rows.filter((o) => !q || o.lines.join(' ').toLowerCase().includes(q));
       if (!shown.length) tbody.append(h('tr', {}, h('td', { colspan: columns.length + 1, class: 'empty' }, rows.length ? 'No matches' : `No ${k.label.toLowerCase()} entries yet`)));
+      const markCol = opts.markCol ?? 0;
       for (const o of shown) {
         const tr = h('tr', { class: o.v.enabled === false ? 'disabled' : '' },
-          columns.map(([, fn, c]) => h('td', { class: c && c.num ? 'num' : '' }, fn(o.v, o))),
+          columns.map(([, fn, c], i) => h('td', { class: c && c.num ? 'num' : '' }, fn(o.v, o), i === markCol ? [' ', changeChip(changeOf(kind, o))] : null)),
           h('td', { class: 'actions' },
             (opts.rowActions || []).map((a) => a(o)),
             h('button', { class: 'small', onclick: () => openForm(kind, o) }, canWrite() && !opts.readonly ? 'Edit' : 'View'),
             canWrite() && !k.fixed && !opts.readonly ? h('button', { class: 'small', onclick: () => openForm(kind, o, { clone: true }) }, 'Clone') : null,
             canWrite() && !k.fixed && !opts.readonly ? h('button', { class: 'small danger', onclick: () => removeObject(kind, o) }, 'Delete') : null));
         tbody.append(tr);
+      }
+      for (const o of deletedObjects(kind).filter((x) => !q || x.lines.join(' ').toLowerCase().includes(q))) {
+        tbody.append(h('tr', { class: 'deleted' },
+          columns.map(([, fn, c], i) => h('td', { class: c && c.num ? 'num' : '' }, h('span', { class: 'struck' }, fn(o.v, o)), i === markCol ? [' ', chip('deleted in candidate', 'bad')] : null)),
+          h('td', { class: 'actions' })));
       }
     };
     search.addEventListener('input', draw);
@@ -218,7 +252,7 @@
     const ok = ['enforcing', 'kernel'].includes(enf.status);
     main.append(
       h('div', { class: `notice ${ok ? 'ok' : enf.status === 'off' ? 'warn' : 'bad'}` },
-        ok ? `Enforcing — ${enf.mode === 'kernel' ? 'kernel (nftables) dataplane, verified' : 'userspace dataplane, all interfaces attached'}.`
+        ok ? `Enforcing — ${enf.mode === 'kernel' ? 'kernel (nftables) dataplane, ruleset verified' : 'userspace dataplane, all interfaces attached, kernel forwarding off'}.`
           : enf.status === 'off' ? 'Dataplane is off (dry run or control plane only): no traffic is being filtered.'
             : 'Degraded — the firewall is not enforcing its policy everywhere:',
         enf.problems && enf.problems.length ? h('ul', {}, enf.problems.map((p) => h('li', {}, p))) : null),
@@ -279,10 +313,11 @@
       ['Source', (v) => h('span', { class: 'mono' }, v.src)], ['Destination', (v) => h('span', { class: 'mono' }, v.dst)],
       ['Service', (v) => [v.proto !== 'any' ? chip(v.proto) : null, h('span', { class: 'mono' }, v.service)]],
       ['App / User', (v) => [v.apps ? listChips(v.apps) : null, v.users ? csv(v.users).map((u) => chip(u, 'warn')) : null]],
-      ['Action', (v) => [actionChip(v.action), v.nat ? chip('NAT', 'info') : null, v.log ? null : chip('no log')]],
+      ['Action', (v) => [actionChip(v.action), v.nat ? chip('NAT', 'info') : null, v.log ? null : chip('no log'), v.enabled ? null : chip('disabled')]],
       ['Profiles', (v) => profileChips(v)],
       ['Hits', (v) => { const x = hitsFor(v.id); return x ? [`${fmtNum(x.packets)} · ${fmtBytes(x.bytes)}`, h('div', { class: 'help' }, fmtAgo(x.last))] : '0'; }, { num: true }],
     ], {
+      markCol: 1,
       rowActions: canWrite() ? [
         (o) => h('button', { class: 'small', title: 'Move up', disabled: all.findIndex((x) => x.key === o.key) === 0, onclick: move(o, -1) }, '↑'),
         (o) => h('button', { class: 'small', title: 'Move down', disabled: all.findIndex((x) => x.key === o.key) === all.length - 1, onclick: move(o, 1) }, '↓'),
@@ -544,7 +579,11 @@
   async function reviewCommit() {
     let diff = '';
     try { diff = await api('GET', '/api/v1/configuration/diff'); } catch (e) { toast(e.message, 'bad'); return; }
-    const pre = h('div', { class: 'diff' }, diff.split('\n').map((l) => h('span', { class: l.startsWith('+') && !l.startsWith('+++') ? 'add' : l.startsWith('-') && !l.startsWith('---') ? 'del' : l.startsWith('@@') ? 'hunk' : '' }, `${l}\n`)));
+    const lineClass = (l) => (l.startsWith('+') && !l.startsWith('+++') ? 'add' : l.startsWith('-') && !l.startsWith('---') ? 'del' : l.startsWith('⋯') || l.startsWith('@@') ? 'hunk' : '');
+    const pre = h('div', { class: 'diff' });
+    const show = (full) => { clear(pre).append(...diffLines(diff, full).map((l) => h('span', { class: lineClass(l) }, `${l}\n`))); };
+    show(false);
+    const toggle = h('button', { class: 'small', onclick: () => { const full = toggle.textContent === 'Show full diff'; show(full); toggle.textContent = full ? 'Show changes only' : 'Show full diff'; } }, 'Show full diff');
     const err = h('div', { class: 'notice bad', hidden: true });
     const commit = h('button', { class: 'primary', onclick: async () => {
       commit.disabled = true;
@@ -554,9 +593,32 @@
         toast(`Committed as revision ${r.revision}${S.model.dataplane === 'kernel' ? ' — kernel ruleset verified' : ''}`, 'ok'); render();
       } catch (e) { err.hidden = false; err.textContent = editError(e); commit.disabled = false; }
     } }, 'Commit');
-    const dlg = modal(`Review changes — ${S.model.changes} line(s)`, [h('p', {}, 'Commit applies these changes to the running configuration (and, in kernel mode, to the kernel, verified).'), err, pre],
+    const fresh = S.model.base === S.model.revision;
+    const status = h('div', { class: 'toolbar' }, chip(`Running revision ${S.model.revision}`), chip(`Candidate based on revision ${S.model.base}`),
+      fresh ? chip('Up to date — no other admin committed since', 'ok')
+        : chip('Another admin committed since — this commit will be refused; discard and redo your changes', 'bad'));
+    const dlg = modal(`Review changes — ${S.model.changes} line(s)`, [h('p', {}, 'Commit applies these changes to the running configuration. In kernel mode the nftables ruleset is installed and verified first; if that fails, nothing changes.'), status, err, pre, h('div', { class: 'toolbar' }, toggle)],
       [h('button', { class: 'danger', onclick: async () => { dlg.close(); await discard(); } }, 'Discard all'), h('button', { onclick: () => dlg.close() }, 'Keep editing'), commit]);
   }
+  // The server's diff is the whole configuration; show only changed lines
+  // with `context` lines around them, collapsing the rest.
+  function diffLines(text, full, context = 3) {
+    const lines = text.replace(/\n+$/, '').split('\n');
+    if (full) return lines;
+    let i = 0; const out = [];
+    while (i < lines.length && (lines[i].startsWith('---') || lines[i].startsWith('+++'))) out.push(lines[i++]);
+    const body = lines.slice(i);
+    const changed = body.map((l) => l.startsWith('+') || l.startsWith('-'));
+    let skipped = 0;
+    body.forEach((l, j) => {
+      let near = false;
+      for (let d = -context; d <= context && !near; d++) near = !!changed[j + d];
+      if (near) { if (skipped) { out.push(`⋯ ${skipped} unchanged line${skipped === 1 ? '' : 's'}`); skipped = 0; } out.push(l); } else skipped++;
+    });
+    if (skipped) out.push(`⋯ ${skipped} unchanged line${skipped === 1 ? '' : 's'}`);
+    return out;
+  }
+
   async function discard() {
     if (!confirm('Discard every pending change in the candidate?')) return;
     try { await api('DELETE', '/api/v1/configuration/candidate'); await loadModel(); toast('Candidate discarded'); render(); } catch (e) { toast(e.message, 'bad'); }

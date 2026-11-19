@@ -79,6 +79,12 @@ tail -20 firewall/EVIDENCE.md
   (for example make the guard `return true`), run its test, then restore. The
   test must fail while broken and pass after the restore.
 
+- **G10 — the container image still builds (§13):** **[root]** `cd firewall && docker build -t firewall:test .`
+  must succeed, and `docker run --rm --sysctl net.ipv4.ip_forward=0 --sysctl net.ipv6.conf.all.forwarding=0 -e VELA_ADMIN_PASSWORD=x-Test-123 firewall:test daemon --config /etc/firewall/firewall.conf --dry-run`
+  must reach `gui: listening`. If the build fails on the toolchain, compare the
+  Dockerfile's `rust:` tag with `rust-version` in `Cargo.toml`; if the daemon
+  exits with `refusing to start the dataplane`, a `--sysctl` flag is missing.
+
 **If G1–G3 fail:** fix the code, never the test, unless the test is provably
 wrong — then say so in the stage report (§15: "do not remove, skip or weaken
 tests"). **If G4/G5 fail:** revert those changes; switch and SDN work belong to
@@ -247,7 +253,7 @@ grep -c -E 'innerHTML|outerHTML|insertAdjacentHTML|document.write' src/ui/app.js
 
 | # | Check | How | Expected |
 | --- | --- | --- | --- |
-| 6.5 | Real UI end to end | start `firewall daemon --config tests/fixtures/ui-sample.conf --dry-run` with `VELA_ADMIN_PASSWORD` set, `npm install jsdom@24`, then `VELA_PASSWORD=… node tests/ui-e2e.js` | `ui-e2e: all checks passed` (11 PASS lines) |
+| 6.5 | Real UI end to end | start `firewall daemon --config tests/fixtures/ui-sample.conf --dry-run` with `VELA_ADMIN_PASSWORD` set, `npm install jsdom@24`, then `VELA_PASSWORD=… node tests/ui-e2e.js` | `ui-e2e: all checks passed` (12 PASS lines) |
 | 6.6 | Parity with §10.2 | open each page listed in README "Web GUI" | every §10.2 row is editable or explicitly view-only (VPN keys, HA settings, interface add/remove) |
 | 6.7 | Real browser (manual) | open the GUI in Firefox and Chrome, light and dark mode | no console errors; dialogs open and close; tables scroll; layout usable at 1280px and on a phone width |
 

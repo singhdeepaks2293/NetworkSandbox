@@ -87,6 +87,7 @@ async function browser() {
   button('Save to candidate', dlg()).click();
   await until(() => !dlg() && b.toastText().includes('Saved to the candidate'), 'policy saved');
   await until(() => [...doc.querySelectorAll('#main tbody tr')].some((tr) => tr.textContent.includes('web-alt')), 'new policy row');
+  assert([...doc.querySelectorAll('#main tbody tr')].find((tr) => tr.textContent.includes('web-alt')).textContent.includes('new in candidate'), 'new row is marked');
   assert(button('Commit (1)') || [...doc.querySelectorAll('#top-commit')].some((x) => /Commit \(\d+\)/.test(x.textContent)), 'commit button shows pending changes');
   console.log('PASS create policy via form → candidate');
 
@@ -117,6 +118,8 @@ async function browser() {
   set('name', 'outbound');
   button('Save to candidate', dlg()).click();
   await until(() => !dlg() && row('outbound'), 'edited policy');
+  assert(row('outbound').textContent.includes('changed in candidate'), 'changed row is marked');
+  assert(row('udp').textContent.includes('disabled'), 'disabled policy shows a disabled chip');
   const before = [...doc.querySelectorAll('#main tbody tr')].map((tr) => tr.cells[0].textContent);
   button('↓', row('outbound')).click();
   await until(() => row('outbound') && row('outbound').cells[0].textContent === '30', 'policy moved down to id 30');
@@ -136,6 +139,11 @@ async function browser() {
   doc.querySelector('#top-commit').click();
   await until(() => dlg() && dlg().querySelector('.diff'), 'diff dialog');
   const diff = dlg().querySelector('.diff').textContent;
+  assert(dlg().textContent.includes('Up to date'), 'commit review shows the candidate is current');
+  assert(/⋯ \d+ unchanged line/.test(diff), 'unchanged context is collapsed');
+  button('Show full diff', dlg()).click();
+  assert(dlg().querySelector('.diff').textContent.includes('system hostname'), 'full diff on request');
+  button('Show changes only', dlg()).click();
   assert(diff.includes('+policy 40') && diff.includes('db-servers'), diff);
   button('Commit', dlg()).click();
   await until(() => b.toastText().includes('Committed as revision'), 'commit toast');
@@ -154,6 +162,13 @@ async function browser() {
   await until(() => doc.querySelector('#main .notice.ok, #main .notice.bad:not(:first-child)'), 'match result');
   assert(doc.querySelector('#main').textContent.includes('Policy 40'), doc.querySelector('#main').textContent);
   console.log('PASS policy match → policy 40');
+
+  // A deleted policy stays visible, marked, until commit or discard.
+  await go('policies', 'Security Policies');
+  const byId = (id) => [...doc.querySelectorAll('#main tbody tr')].find((tr) => tr.cells[0].textContent.startsWith(String(id)));
+  button('Delete', byId(10)).click();
+  await until(() => byId(10) && byId(10).classList.contains('deleted') && byId(10).textContent.includes('deleted in candidate'), 'deleted row marked');
+  console.log('PASS change markers: new, changed, deleted, disabled; commit shows up-to-date');
 
   // Configuration values are rendered as text, never as HTML.
   await go('urlfilter', 'URL Filtering');

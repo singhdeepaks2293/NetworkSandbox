@@ -4,6 +4,8 @@ version = "0.2.0"
 edition = "2021"
 description = "A lightweight educational next-generation IPv4 firewall in Rust: App-ID, zone-based list policies, NAT rulebases, FortiOS- and PAN-OS-style CLIs and a web GUI"
 license = "MIT"
+# Oldest toolchain the test suite has passed on (the locked `time` crate needs 1.88).
+rust-version = "1.89"
 
 [dependencies]
 argon2 = { version = "0.5", features = ["std"] }

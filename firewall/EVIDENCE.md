@@ -55,13 +55,18 @@ handling and tests in this repository were written from scratch.
 
 | 2026-11-20 | `stage6-gui` | `cargo test --release` | 175 passed, 0 failed (10 new: editor module, GUI edit path, kernel-mode edit refusal) |
 | 2026-11-20 | `stage6-gui` | `node tests/ui-model.test.js` | 47 objects across 22 kinds round-tripped byte-identically |
-| 2026-11-20 | `stage6-gui` | `node tests/ui-e2e.js` (jsdom 24, daemon `--dry-run` on `tests/fixtures/ui-sample.conf`) | 11 PASS: login, 27 pages render, create/edit/reorder via forms, inline and server validation errors, diff + commit, policy match, HTML injection rendered as text, discard, read-only role (no controls, 403), CSRF enforced |
+| 2026-11-20 | `stage6-gui` | `node tests/ui-e2e.js` (jsdom 24, daemon `--dry-run` on `tests/fixtures/ui-sample.conf`) | 12 PASS: login, 27 pages render, create/edit/reorder via forms, inline and server validation errors, diff + commit (collapsed context, full-diff toggle, up-to-date status), policy match, change markers (new, changed, deleted, disabled), HTML injection rendered as text, discard, read-only role (no controls, 403), CSRF enforced |
+
+| 2026-11-20 | `stage6-gui` | `cargo +1.85 build --release --locked` | FAILED, also at baseline `8312f73`: locked `time 0.3.55` (via rcgen) needs Rust 1.88; the Dockerfile's `rust:1.85-alpine` could not build the image |
+| 2026-11-20 | `stage6-gui` | `cargo +1.89 build --release --locked` and `cargo +1.89 test --release --locked` | built; 175 passed, 0 failed → Dockerfile moved to `rust:1.89-alpine`, `rust-version = "1.89"` |
 
 Not yet run on this branch: `tests/network-namespace.sh`, `tests/nft-kernel.sh`,
 `tests/containerlab-policy.sh`, `tests/containerlab-chain.sh`, and the new
 `tests/kernel-mode.sh` (written in Stage 2, never executed). The GUI has not
 been checked in a real browser (only jsdom): visual layout, dark mode and
-`<dialog>` behaviour need a manual look. They need root,
+`<dialog>` behaviour need a manual look. `docker build` has not been run
+(no Docker in that environment, and the musl/Alpine build is untested): run
+`make image` and record the result. They need root,
 network namespaces and containerlab, which the environment used for these runs
 did not have. Run them on a privileged Linux host and add the results here
 before merging.
