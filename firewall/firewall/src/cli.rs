@@ -457,17 +457,17 @@ fn policy_add(engine: &Engine, words: &[&str]) -> String {
         return "usage: policy add [vdom NAME] ...".to_string();
     }
     let line = format!("policy {}", body.join(" "));
+    // Revision before config: if a commit lands in between, the base check
+    // in apply_config_from refuses this edit instead of overwriting it.
+    let base = engine.config_revision();
     let cfg = engine.cfg.read().unwrap().clone();
     let mut text = cfg.to_text();
     text.push_str(&format!("\nvdom {vdom}\n{line}\n"));
-    match Config::parse(&text) {
-        Ok(parsed) => {
-            *engine.cfg.write().unwrap() = parsed;
-            match engine.save() {
-                Ok(()) => format!("policy added\n{line}"),
-                Err(e) => format!("policy added in memory; save failed: {e}"),
-            }
-        }
+    // Through the same path as every other commit: validation, history
+    // (so `rollback` works), revision bump (so open sessions are re-checked)
+    // and save before activation (so disk and running config never diverge).
+    match Config::parse(&text).and_then(|parsed| engine.apply_config_from(base, &parsed)) {
+        Ok(()) => format!("policy added\n{line}"),
         Err(e) => format!("error: {e}"),
     }
 }
@@ -479,16 +479,18 @@ fn policy_delete(engine: &Engine, words: &[&str]) -> String {
     let Ok(id) = raw.parse::<u32>() else {
         return format!("error: invalid policy id '{raw}'");
     };
+    // Policy ids are unique across all VDOMs (the parser rejects duplicates),
+    // so the id alone names one policy.
+    let base = engine.config_revision();
     let mut cfg = engine.cfg.read().unwrap().clone();
     let before = cfg.policies.len();
     cfg.policies.retain(|p| p.id != id);
     if cfg.policies.len() == before {
         return format!("error: policy {id} not found");
     }
-    *engine.cfg.write().unwrap() = cfg;
-    match engine.save() {
+    match engine.apply_config_from(base, &cfg) {
         Ok(()) => format!("policy {id} deleted"),
-        Err(e) => format!("policy {id} deleted in memory; save failed: {e}"),
+        Err(e) => format!("error: {e}"),
     }
 }
 

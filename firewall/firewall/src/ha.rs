@@ -401,6 +401,9 @@ pub fn import_session(s: &SyncedSession, indexes: &HashMap<String, i32>, now: In
         app_buf: [Vec::new(), Vec::new()],
         app_seq: [None, None],
         user: s.user.clone(),
+        // Revision 0 never matches a live revision, so a synced session is
+        // re-checked against this node's rulebase on its first packet.
+        rev: 0,
     })
 }
 

@@ -118,29 +118,148 @@ VELA_API_TOKEN=vela_... ./target/release/firewall cli -c "show version"
 Management settings include `system cli-bind`, `system gui-bind`,
 `system tls on|off`, `system tls-cert`, `system tls-key`, `system api-rate`,
 `system api-burst`, `system max-body`, `system max-packet`,
-`system max-inspection`, `system source-rate` and `system source-burst`.
+`system max-inspection`, `system source-rate`, `system source-burst`,
+`system kernel-forwarding refuse|warn` and `system cli-remote-plaintext on|off`.
+
+### Fail-closed startup and truthful health
+
+The userspace engine receives *copies* of frames through AF_PACKET; it cannot
+stop the kernel from routing the originals. If kernel forwarding is on, traffic
+would reach its destination unfiltered alongside the firewall. So before
+starting the dataplane the daemon checks `net.ipv4.ip_forward`,
+`net.ipv6.conf.all.forwarding` and the per-interface `forwarding` switches of
+every configured interface, and **refuses to start** if any is on:
+
+```sh
+sudo sysctl -w net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
+```
+
+`system kernel-forwarding warn` starts anyway and reports the firewall as
+degraded. A monitor re-checks every 5 seconds and logs changes.
+
+`GET /healthz` (also `/api/v1/health`) returns `200 {"status":"ok","dataplane":"enforcing"}`
+only when the packet loop is running, every configured interface is attached
+and kernel forwarding is off. Otherwise it returns **503**
+`{"status":"degraded"}`; authenticated callers also get the list of problems.
+`dataplane` is `off` for `--dry-run`/`--no-dataplane`. The system API
+(`/api/v1/system`) carries the same information under `enforcement`.
+
+The CLI transport is plaintext and carries credentials, so the daemon refuses
+a non-loopback `system cli-bind` unless `system cli-remote-plaintext on`.
+
+### Configuration commits
+
+Every write path (GUI/REST candidate commit, native CLI `policy add|delete`,
+FortiOS- and PAN-OS-style commits, rollback, restore) goes through one
+serialized commit: validate, save to disk, activate, record history, bump the
+revision. Commits are refused when they are based on an outdated revision, so
+two administrators cannot silently overwrite each other:
+
+- `GET /api/config` returns `X-Config-Revision`; a client that sends it back
+  as `X-Config-Base` when staging gets **409 Conflict** if another commit
+  landed in between. Committing a candidate staged before another commit is
+  also refused with 409.
+- A FortiOS-style `edit` block or a PAN-OS-style candidate started before
+  another commit is refused on `next`/`end`/`commit`; `abort` (FortiOS) or
+  `revert` (PAN-OS) starts again from the running configuration.
+
+After a commit, each open session is re-checked on its next packet against
+the new rulebase (same zones, translated destination, application and user as
+its first lookup). It survives only if the same policy still matches and
+permits it, so narrowing a permit or inserting a deny above it cuts flows that
+are already open.
 For a lost password run `firewall password-reset-token --config PATH
 --username NAME`, then POST the token and a new password to
 `/api/v1/auth/password-reset`.
 
-## Kernel nftables backend (opt-in)
+## Web GUI
 
-The daemon's userspace engine remains the default dataplane. An explicit
-command installs the same IPv4 zones, policies, state rules, logging, counters,
-DNAT and masquerade rules into the kernel:
+Open `https://<gui-bind>:<gui-port>/` (loopback by default) and sign in with
+an administrator account. The GUI configures everything the CLI does for
+day-to-day operation, in the way commercial firewalls work:
 
-```sh
-sudo ./target/release/firewall nft-apply --config examples/ngfw.conf
-sudo nft list table inet vela
-sudo ./target/release/firewall nft-remove
+- **Candidate configuration.** Every form edit goes into a candidate; the top
+  bar shows `Commit (N)`. *Commit* shows the diff first, then applies it
+  through the same pipeline as the CLI (in kernel mode the kernel ruleset is
+  installed and verified before the commit succeeds). *Discard* drops the
+  candidate; System → Configuration also offers rollback, backup download,
+  restore and an advanced raw editor.
+- **Pages:** Dashboard (health, enforcement, traffic, interfaces); Network
+  (interface zones, static IPv4/IPv6 routes); Policy & Objects (security
+  policies with reorder, enable/disable and hit counts, default rules, source
+  and destination NAT, addresses and groups, services and groups, custom
+  applications and application groups); Security Profiles (URL filters, IPS
+  and payload signatures, profile groups, shapers, zone flood protection);
+  User & Authentication (User-ID mappings, user groups and maps,
+  administrators and API tokens, password change); Monitor (sessions, traffic
+  log, policy hit counts); System (settings, HA suspend/resume, VPN view,
+  configuration, audit log); Tools (policy match test).
+- **One parser.** Forms send structured edits (`POST /api/v1/configuration/edit`,
+  one object per edit); the server applies them to the canonical text and
+  re-parses it with the CLI's parser, so the GUI cannot produce a configuration
+  the CLI would reject. Edits based on an outdated revision get 409.
+- **Security.** Separate same-origin JS/CSS under a strict CSP (`script-src
+  'self'`, no inline code); all values rendered as text, never HTML; CSRF
+  token on every write; read-only roles (`security_analyst`, `auditor`) see no
+  edit controls and are refused by the server.
+- **Not editable in the GUI:** adding or removing interfaces (needs a restart),
+  WireGuard keys and HA settings (CLI or raw editor).
+
+UI tests: `node tests/ui-model.test.js` (no dependencies) checks that every
+object kind round-trips byte-for-byte through the forms' model;
+`tests/ui-e2e.js` drives the real UI in jsdom against a running daemon (see
+the file header).
+
+## Kernel nftables dataplane (opt-in)
+
+The userspace AF_PACKET engine is the default dataplane (mode A). With
+`system dataplane kernel` (mode B) the daemon enforces in the kernel instead:
+
+```text
+system dataplane kernel
 ```
 
-Ownership is limited to `inet vela`; no other table is flushed or modified.
-Each apply atomically replaces that table, so re-run `nft-apply` after
-configuration changes. Kernel enforcement does not start automatically and
-does not track later GUI/CLI edits. Do not run the userspace forwarding engine
-and the kernel rules for the same traffic at the same time. IPv6 is not yet
-translated; `Cidr` and packet handling are IPv4-only.
+```sh
+sudo sysctl -w net.ipv4.ip_forward=1     # the kernel forwards in this mode
+sudo ./target/release/firewall daemon --config firewall.conf
+sudo nft list table inet vela            # rules carry comment "vela:<generation>:<n>"
+```
+
+- **One enforcement path.** In kernel mode the AF_PACKET engine does not
+  forward; the kernel-forwarding refusal of mode A does not apply. The mode is
+  fixed at startup (changing `system dataplane` needs a restart).
+- **Exact or refused.** The kernel plan never weakens a policy. A
+  configuration is refused, with the reasons, when it contains anything the
+  kernel cannot enforce exactly: App-ID, address negation, user-scoped rules,
+  permits with URL/IPS/AV/shaper/profile-group inspection, IPv6 parts or
+  unrepresentable services in a deny (dropping them would widen access), zone
+  flood protection, `source-rate`, HA or WireGuard. Use mode A for those.
+- **Startup.** The running configuration is installed atomically, read back
+  over netlink and verified before the daemon reports healthy. If that fails,
+  the table is replaced by a drop-all forward chain (lockdown) and the daemon
+  exits with the error.
+- **Every commit** (GUI, REST, every CLI style, rollback, restore) goes
+  kernel first: install, verify; if that fails the previous ruleset is
+  reinstalled and verified and the commit is refused; if that fails too,
+  forwarding is locked down and the firewall reports degraded. Only after the
+  kernel accepted the change is it saved to disk and activated.
+- **Verification** compares chains, hooks, chain policies and every rule's
+  tag in order, so a missing, foreign, reordered or replaced rule is detected.
+- **Drift.** Every 5 seconds the monitor re-verifies the table. On an
+  external change it reinstalls the running configuration (logged as `kernel
+  dataplane drift detected ...`), or locks down if that fails.
+- **Health.** `/healthz` reports `"dataplane":"kernel"` only while the
+  installed ruleset is verified and `net.ipv4.ip_forward` is 1; otherwise 503
+  `degraded`.
+- **Shutdown.** The table is left in place when the daemon exits or crashes,
+  so the last verified ruleset keeps being enforced. `firewall nft-remove`
+  deletes it.
+- **Ownership** is limited to `inet vela`; no other table is flushed or
+  modified. IPv6 address matching is not translated (see the exactness rule).
+
+`firewall nft-apply --config PATH` still installs a ruleset once, for
+diagnostics, and applies the same exactness rule. It refuses to run while a
+daemon using the same configuration holds `<config>.lock`.
 
 ## Configuration
 
@@ -270,9 +389,16 @@ policy 40 trust untrust 2001:db8:1::/64 any any any permit
   address (FortiOS itself uses separate `address6` objects). PAN-OS style:
   `layer3 ipv6 address` and IPv6 `ip-netmask` values.
 
-Not implemented for IPv6: NAT66/NPTv6, DNAT, router advertisements, flood
-limits, User-ID mappings (IPv6 users are `unknown`), HA session sync, IPv6
-inside WireGuard and the kernel nftables backend (which now guards its IPv4
+Zone flood limits (`syn-flood`, `udp-flood`, `icmp-flood`) apply to IPv6 and
+share the IPv4 counters, so a zone's limit covers both families.
+
+User-ID maps IPv4 sources only. So that IPv6 cannot be used to bypass
+user-scoped rules, they **fail closed** for IPv6 sources: a user-scoped
+`deny`/`reject` applies to every IPv6 source, and a user-scoped `permit` never
+matches one (unless it lists `unknown`).
+
+Not implemented for IPv6: NAT66/NPTv6, DNAT, router advertisements, User-ID
+mappings, HA session sync, IPv6 inside WireGuard and the kernel nftables backend (which now guards its IPv4
 address matches so they can never match an IPv6 packet).
 
 ## TLS decryption (inspection engine; not yet in the dataplane)
@@ -412,9 +538,13 @@ interface address or VDOM changes still need a daemon restart.
 ## Tests
 
 ```sh
-cargo test
+cargo test                      # 175 unit/engine tests, no privileges needed
+node tests/ui-model.test.js     # GUI object model round trip
 sudo bash tests/nft-kernel.sh
+sudo bash tests/kernel-mode.sh  # daemon-managed kernel dataplane
 ```
+
+See `AUDIT.md` for the Stage 1 audit and `EVIDENCE.md` for recorded runs.
 
 `tests/network-namespace.sh` builds a local namespace topology.
 `tests/nft-kernel.sh` checks the nftables backend in an isolated topology:
@@ -447,9 +577,10 @@ through the chain, DNAT, URL blocking/allowing and an inserted deny policy.
   IPsec or dynamic routing. HA is active/passive
   only (no active/active, link monitoring or virtual MACs). User-ID
   has no LDAP/AD connector; mappings are pushed or static.
-- The CLI transport is plaintext; bind it to loopback or tunnel it. The GUI
-  supports TLS and should still be exposed only on a trusted network.
+- The CLI transport is plaintext; the daemon refuses a non-loopback bind
+  unless `system cli-remote-plaintext on`. Tunnel it instead. The GUI supports
+  TLS and should still be exposed only on a trusted network.
 - ARP misses drop the first packet rather than queueing it.
-- The kernel nftables backend refuses policies that need App-ID or address
-  negation instead of widening them; those stay in the userspace engine.
+- The kernel dataplane refuses every configuration it cannot enforce exactly
+  (see "Kernel nftables dataplane"); those features need the userspace engine.
 - VDOMs isolate forwarding configuration, not administrative access.

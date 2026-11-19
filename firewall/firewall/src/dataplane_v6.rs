@@ -14,8 +14,13 @@
 //! - ICMPv6 echo to our addresses is answered; Time Exceeded, Destination
 //!   Unreachable and TCP RST are sent like their IPv4 counterparts.
 //!
-//! Not implemented for IPv6: NAT66/NPTv6, DNAT, flood limits, User-ID
-//! mappings, HA session sync and IPv6 inside WireGuard.
+//! - zone flood limits (SYN, UDP, ICMP echo) share the IPv4 counters;
+//! - User-ID maps IPv4 sources only, so user-scoped rules fail closed for
+//!   IPv6: a user-scoped deny applies to every IPv6 source and a user-scoped
+//!   permit never matches one (see `Config::user_matches_ip`).
+//!
+//! Not implemented for IPv6: NAT66/NPTv6, DNAT, User-ID mappings, HA session
+//! sync and IPv6 inside WireGuard.
 
 use super::*;
 use crate::packet::{add_bytes, fold_checksum};
@@ -58,6 +63,9 @@ pub struct Session6 {
     pub expires: Instant,
     pub src_zone: String,
     pub dst_zone: String,
+    /// Configuration revision the policy decision was last checked against
+    /// (see `Engine::session_still_permitted`).
+    pub rev: u64,
 }
 
 #[derive(Default)]
@@ -365,6 +373,33 @@ impl Engine {
         self.send6(slot, src_mac, &build(v.dst, v.src, PROTO_TCP, 64, l4, Some(16)));
     }
 
+    /// IPv6 counterpart of `Engine::session_still_permitted`.
+    fn session6_still_permitted(&self, cfg: &Config, s: &Session6) -> bool {
+        let rev = self.config_revision();
+        if s.rev == rev {
+            return true;
+        }
+        let ok = cfg
+            .match_or_default_ip(
+                &s.key.vdom,
+                &s.src_zone,
+                &s.dst_zone,
+                IpAddr::V6(s.key.src),
+                IpAddr::V6(s.key.dst),
+                s.key.proto,
+                s.key.dport,
+                s.app.as_deref(),
+                None,
+            )
+            .is_some_and(|p| p.id == s.policy_id && p.action == Action::Permit);
+        if ok {
+            if let Some(x) = self.sessions6.lock().unwrap().get_mut(&s.key) {
+                x.rev = rev;
+            }
+        }
+        ok
+    }
+
     fn app_verdict6<'c>(&self, cfg: &'c Config, s: &Session6, from_client: bool, seq: Option<u32>, payload: &[u8]) -> AppV6<'c> {
         let mut table = self.sessions6.lock().unwrap();
         let (buf, full) = table.feed(&s.key, from_client, seq, payload);
@@ -496,7 +531,10 @@ impl Engine {
                     Some(s) => s.clone(),
                     None => return,
                 };
-                let Some(mut policy) = cfg.policy_by_id(&vdom, s.policy_id).filter(|p| p.enabled && p.action == Action::Permit) else {
+                let Some(mut policy) = cfg
+                    .policy_by_id(&vdom, s.policy_id)
+                    .filter(|p| p.enabled && p.action == Action::Permit && self.session6_still_permitted(cfg, &s))
+                else {
                     if let Some(x) = self.sessions6.lock().unwrap().get_mut(&fkey) {
                         x.expires = now;
                     }
@@ -555,6 +593,25 @@ impl Engine {
                     return self.drop6(slot);
                 };
                 let Some(egress_slot) = self.iface_slot(&egress.name) else { return self.drop6(slot) };
+                // Zone protection, sharing the IPv4 counters so a zone's limit
+                // covers both families instead of doubling over IPv6.
+                if let Some(zone) = cfg.zone(&in_zone, &vdom) {
+                    let flood = if proto == PROTO_TCP {
+                        zone.syn_flood.map(|limit| ("syn", self.flood_exceeded(&zone.name, "syn", limit)))
+                    } else if proto == PROTO_ICMPV6 && l4.first() == Some(&128) {
+                        zone.icmp_flood.map(|limit| ("icmp", self.flood_exceeded(&zone.name, "icmp", limit)))
+                    } else if proto == PROTO_UDP {
+                        zone.udp_flood.map(|limit| ("udp", self.flood_exceeded(&zone.name, "udp", limit)))
+                    } else {
+                        None
+                    };
+                    if let Some((kind, true)) = flood {
+                        let reason = format!("zone-protection {kind}-flood");
+                        self.log_event(cfg, "deny", v.src, sport, v.dst, dport, proto, &in_zone, &egress.zone, None, &reason);
+                        self.stats.lock().unwrap().denied += 1;
+                        return self.drop6(slot);
+                    }
+                }
                 let app0: Option<String> = match proto {
                     PROTO_ICMPV6 => Some(if matches!(l4.first(), Some(128 | 129)) { "ping" } else { "icmp" }.to_string()),
                     PROTO_TCP | PROTO_UDP => cfg
@@ -618,6 +675,7 @@ impl Engine {
                     expires: now + Duration::from_secs(timeout),
                     src_zone: in_zone.clone(),
                     dst_zone: egress.zone.clone(),
+                    rev: self.config_revision(),
                 });
                 self.stats.lock().unwrap().accepted += 1;
                 self.bump_hit(&vdom, policy.id, v.total as u64);

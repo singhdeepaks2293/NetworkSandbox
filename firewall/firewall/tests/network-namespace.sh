@@ -66,6 +66,7 @@ ip netns exec fw_ns_wan ip addr add 10.0.0.99/24 dev hwan0
 ip netns exec fw_ns_wan ip link set hwan0 up
 ip netns exec fw_ns_wan ip route add default via 10.0.0.1
 sysctl -qw net.ipv4.ip_forward=0
+sysctl -qw net.ipv6.conf.all.forwarding=0 2>/dev/null || true
 sysctl -qw net.ipv4.conf.all.send_redirects=0
 sysctl -qw net.ipv4.conf.fwlan0.send_redirects=0
 sysctl -qw net.ipv4.conf.fwwan0.send_redirects=0

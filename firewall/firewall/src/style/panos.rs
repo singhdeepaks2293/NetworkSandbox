@@ -36,11 +36,13 @@ enum Mode {
 pub struct PanOs {
     mode: Mode,
     candidate: Option<Config>,
+    /// Running revision the candidate was copied from.
+    base: u64,
 }
 
 impl PanOs {
     pub fn new() -> PanOs {
-        PanOs { mode: Mode::Operational, candidate: None }
+        PanOs { mode: Mode::Operational, candidate: None, base: 0 }
     }
 }
 
@@ -166,7 +168,8 @@ impl PanOs {
                 }
                 self.mode = Mode::Configure;
                 if self.candidate.is_none() {
-                    self.candidate = Some(ctx.store.running());
+                    let fresh = self.begin(ctx);
+                    self.candidate = Some(fresh);
                 }
                 Ok("Entering configuration mode".into())
             }
@@ -352,17 +355,25 @@ impl PanOs {
             }
             "run" => self.operational(&w[1..], ctx),
             "show" => {
-                let cand = self.candidate.get_or_insert_with(|| ctx.store.running());
+                if self.candidate.is_none() {
+                    let fresh = self.begin(ctx);
+                    self.candidate = Some(fresh);
+                }
+                let cand = self.candidate.as_ref().expect("just set");
                 let rest: Vec<&str> = w[1..].iter().map(String::as_str).collect();
                 Ok(filter(&render(cand), &rest))
             }
             "commit" => self.commit(ctx),
             "revert" => {
-                self.candidate = Some(ctx.store.running());
+                let fresh = self.begin(ctx);
+                self.candidate = Some(fresh);
                 Ok("Candidate configuration reverted to the running configuration".into())
             }
             "set" | "delete" | "move" | "rename" => {
-                let mut cand = self.candidate.take().unwrap_or_else(|| ctx.store.running());
+                let mut cand = match self.candidate.take() {
+                    Some(cand) => cand,
+                    None => self.begin(ctx),
+                };
                 let (vdom, body) = match (w.get(1).map(String::as_str), w.get(2)) {
                     (Some("vsys"), Some(vsys)) => (vsys_to_vdom(vsys), &w[3..]),
                     _ => ("root".to_string(), &w[1..]),
@@ -388,8 +399,20 @@ impl PanOs {
         }
     }
 
+    /// Copy the running configuration for a new candidate, remembering the
+    /// revision it came from (read first, so a racing commit is caught).
+    fn begin(&mut self, ctx: &Ctx<'_>) -> Config {
+        self.base = ctx.store.revision();
+        ctx.store.running()
+    }
+
     fn commit(&mut self, ctx: &Ctx<'_>) -> R {
-        let cand = self.candidate.get_or_insert_with(|| ctx.store.running());
+        if self.candidate.is_none() {
+            let fresh = self.begin(ctx);
+            self.candidate = Some(fresh);
+        }
+        let base = self.base;
+        let cand = self.candidate.as_mut().expect("just set");
         let mut problems = Vec::new();
         for p in &cand.policies {
             for (field, empty) in [("from", p.src_zones.is_empty()), ("to", p.dst_zones.is_empty()), ("source", p.src.is_empty()), ("destination", p.dst.is_empty())] {
@@ -422,9 +445,10 @@ impl PanOs {
         if cand.to_text() == ctx.store.running().to_text() {
             return Ok("There are no changes to commit.".into());
         }
-        match ctx.store.commit(cand) {
+        match ctx.store.commit_from(base, cand) {
             Ok(()) => {
-                self.candidate = Some(ctx.store.running());
+                let fresh = self.begin(ctx);
+                self.candidate = Some(fresh);
                 Ok("Configuration committed successfully".into())
             }
             Err(e) => fail(format!("Commit failed\n{e}")),
@@ -1455,5 +1479,30 @@ interface ethernet1/3 zone ethernet1/3 address 10.1.0.1/24
         let ctx = Ctx { store: &store, can_write: false };
         assert!(s.exec("configure", &ctx).contains("permission denied"));
         assert!(s.exec("show system info", &ctx).contains("hostname: PA-LAB"));
+    }
+
+    #[test]
+    fn c9_candidate_older_than_running_is_refused_at_commit() {
+        let engine = crate::dataplane::Engine::for_test_with_file(
+            Config::parse(
+                "interface ethernet1/1 zone trust address 10.0.0.1/24\n\
+                 interface ethernet1/2 zone untrust address 203.0.113.1/24\n",
+            )
+            .unwrap(),
+        );
+        let ctx = crate::style::Ctx { store: &engine, can_write: true };
+        let mut s = PanOs::new();
+        s.exec("configure", &ctx);
+        // Another administrator commits while this candidate is open.
+        let mut other = engine.cfg.read().unwrap().clone();
+        other.settings.hostname = "changed-elsewhere".into();
+        engine.apply_config(&other).unwrap();
+        let out = s.exec("commit", &ctx);
+        assert!(out.contains("changed since"), "{out}");
+        assert_eq!(engine.cfg.read().unwrap().settings.hostname, "changed-elsewhere");
+        // After `revert` the candidate is current again and commits.
+        s.exec("revert", &ctx);
+        let out = s.exec("commit", &ctx);
+        assert!(!out.contains("changed since"), "{out}");
     }
 }

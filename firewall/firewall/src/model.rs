@@ -694,6 +694,17 @@ pub struct Settings {
     pub source_burst: u32,
     /// Default CLI style for new CLI sessions: native, fortios or panos.
     pub cli_style: String,
+    /// `system kernel-forwarding refuse` (default): the daemon will not start
+    /// its dataplane while the kernel would forward between its interfaces,
+    /// because the kernel would route traffic around the engine. `warn`
+    /// starts anyway and reports the firewall as degraded.
+    pub kernel_forwarding_refuse: bool,
+    /// The CLI transport is plaintext TCP. Binding it to a non-loopback
+    /// address is refused unless `system cli-remote-plaintext on`.
+    pub cli_remote_plaintext: bool,
+    /// `system dataplane kernel`: enforce in the kernel (nftables) instead of
+    /// the userspace AF_PACKET engine. Fixed at startup.
+    pub dataplane_kernel: bool,
 }
 
 impl Default for Settings {
@@ -722,6 +733,9 @@ impl Default for Settings {
             source_rate: 0,
             source_burst: 0,
             cli_style: "native".to_string(),
+            kernel_forwarding_refuse: true,
+            cli_remote_plaintext: false,
+            dataplane_kernel: false,
         }
     }
 }
@@ -864,6 +878,27 @@ impl Config {
                 s.max_sessions = value
                     .parse()
                     .map_err(|_| "invalid max-sessions".to_string())?
+            }
+            "kernel-forwarding" => {
+                s.kernel_forwarding_refuse = match value {
+                    "refuse" => true,
+                    "warn" => false,
+                    _ => return Err("kernel-forwarding must be refuse or warn".to_string()),
+                }
+            }
+            "dataplane" => {
+                s.dataplane_kernel = match value {
+                    "kernel" => true,
+                    "userspace" => false,
+                    _ => return Err("dataplane must be userspace or kernel".to_string()),
+                }
+            }
+            "cli-remote-plaintext" => {
+                s.cli_remote_plaintext = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("cli-remote-plaintext must be on or off".to_string()),
+                }
             }
             "max-sessions-per-ip" => {
                 s.max_sessions_per_ip = value
@@ -2113,7 +2148,7 @@ impl Config {
             .filter(|p| self.addr_list_matches_ip(&p.dst, p.negate_dst, dst))
             .filter(|p| self.service_list_matches(p, proto, dst_port, app))
             .filter(|p| self.app_matches(&p.apps, app))
-            .filter(|p| self.user_matches(&p.users, user))
+            .filter(|p| self.user_matches_ip(p, src, user))
             // While the application is unknown, a deny rule that names
             // applications cannot apply yet: it is skipped so the handshake can
             // complete, and re-checked once App-ID has a verdict.
@@ -2232,6 +2267,20 @@ impl Config {
         }
     }
 
+    /// User matching for either address family. User-ID maps IPv4 sources
+    /// only, so an IPv6 source never has a known user. Matching that the same
+    /// way as an unknown IPv4 user would let IPv6 traffic slip past a rule
+    /// such as `deny user contractors`, so IPv6 fails closed instead: a
+    /// user-scoped deny or reject applies to every IPv6 source, and a
+    /// user-scoped permit never matches one (unless it names `unknown`).
+    fn user_matches_ip(&self, p: &Policy, src: IpAddr, user: Option<&str>) -> bool {
+        let scoped = !(p.users.is_empty() || p.users.iter().any(|u| u == "any"));
+        if src.is_ipv6() && user.is_none() && scoped {
+            return p.action != Action::Permit || p.users.iter().any(|u| u == UNKNOWN_USER);
+        }
+        self.user_matches(&p.users, user)
+    }
+
     /// `entry` is the user itself, or a group that contains it (nested).
     pub fn user_in(&self, entry: &str, user: &str, depth: usize) -> bool {
         if entry.eq_ignore_ascii_case(user) {
@@ -2307,6 +2356,15 @@ impl Config {
         ));
         out.push_str(&format!("system source-rate {}\n", s.source_rate));
         out.push_str(&format!("system source-burst {}\n", s.source_burst));
+        if !s.kernel_forwarding_refuse {
+            out.push_str("system kernel-forwarding warn\n");
+        }
+        if s.cli_remote_plaintext {
+            out.push_str("system cli-remote-plaintext on\n");
+        }
+        if s.dataplane_kernel {
+            out.push_str("system dataplane kernel\n");
+        }
         if s.cli_style != "native" {
             out.push_str(&format!("system cli-style {}\n", s.cli_style));
         }
@@ -3194,5 +3252,70 @@ policy 30 trust untrust 10.0.0.0/24 any any any deny
         assert_eq!(Config::parse(&cfg.to_text()).unwrap().to_text(), cfg.to_text());
         assert!(Cidr6::parse("2001:db8::/129").is_err());
         assert!(Config::parse("route6 default nowhere\n").is_err());
+    }
+
+    #[test]
+    fn c5_user_scoped_rules_fail_closed_for_ipv6_sources() {
+        let cfg = Config::parse(
+            "interface lan zone trust address 10.0.0.1/24 address6 2001:db8:1::1/64\n\
+             interface wan zone untrust address 203.0.113.1/24 address6 2001:db8:2::1/64\n\
+             policy 5 trust untrust any any tcp any deny user contractors\n\
+             policy 7 trust untrust any any tcp 22 permit user alice\n\
+             policy 8 trust untrust any any tcp 23 permit user unknown\n\
+             policy 10 trust untrust any any tcp any permit\n",
+        )
+        .unwrap();
+        let v6 = |port| {
+            cfg.match_policy_ip(
+                "root", "trust", "untrust",
+                "2001:db8:1::10".parse().unwrap(), "2001:db8:2::10".parse().unwrap(),
+                6, port, None, None,
+            )
+            .map(|p| p.id)
+        };
+        // IPv6 has no User-ID, so the user-scoped deny applies to every source.
+        assert_eq!(v6(443), Some(5), "deny user contractors must not be bypassed over IPv6");
+        // IPv4 keeps its semantics: an unknown user is not a contractor.
+        let v4 = cfg
+            .match_policy_ip(
+                "root", "trust", "untrust",
+                "10.0.0.10".parse().unwrap(), "203.0.113.10".parse().unwrap(),
+                6, 443, None, None,
+            )
+            .map(|p| p.id);
+        assert_eq!(v4, Some(10));
+        // A user-scoped permit never matches IPv6 (it falls through to the
+        // deny above it anyway); `unknown` keeps matching unidentified users.
+        let only_permits = Config::parse(
+            "interface lan zone trust address 10.0.0.1/24 address6 2001:db8:1::1/64\n\
+             interface wan zone untrust address 203.0.113.1/24 address6 2001:db8:2::1/64\n\
+             policy 7 trust untrust any any tcp 22 permit user alice\n\
+             policy 8 trust untrust any any tcp 23 permit user unknown\n",
+        )
+        .unwrap();
+        let m = |port| {
+            only_permits
+                .match_policy_ip(
+                    "root", "trust", "untrust",
+                    "2001:db8:1::10".parse().unwrap(), "2001:db8:2::10".parse().unwrap(),
+                    6, port, None, None,
+                )
+                .map(|p| p.id)
+        };
+        assert_eq!(m(22), None, "permit user alice does not match an IPv6 source");
+        assert_eq!(m(23), Some(8), "permit user unknown still matches");
+    }
+
+    #[test]
+    fn kernel_forwarding_and_cli_plaintext_settings_round_trip() {
+        let cfg = Config::parse("system kernel-forwarding warn\nsystem cli-remote-plaintext on\n").unwrap();
+        assert!(!cfg.settings.kernel_forwarding_refuse);
+        assert!(cfg.settings.cli_remote_plaintext);
+        let again = Config::parse(&cfg.to_text()).unwrap();
+        assert!(!again.settings.kernel_forwarding_refuse && again.settings.cli_remote_plaintext);
+        let default = Config::parse("").unwrap();
+        assert!(default.settings.kernel_forwarding_refuse && !default.settings.cli_remote_plaintext);
+        assert!(!default.to_text().contains("kernel-forwarding"), "defaults are not written out");
+        assert!(Config::parse("system kernel-forwarding maybe\n").is_err());
     }
 }

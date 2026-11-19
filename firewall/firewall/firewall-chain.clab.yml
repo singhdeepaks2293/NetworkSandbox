@@ -43,6 +43,7 @@ topology:
         - examples/chain-fw1.conf:/etc/firewall/firewall.conf:ro
       sysctls:
         net.ipv4.ip_forward: 0
+        net.ipv6.conf.all.forwarding: 0
 
     fw2:
       kind: linux
@@ -52,6 +53,7 @@ topology:
         - examples/chain-fw2.conf:/etc/firewall/firewall.conf:ro
       sysctls:
         net.ipv4.ip_forward: 0
+        net.ipv6.conf.all.forwarding: 0
 
     sw2:
       kind: linux

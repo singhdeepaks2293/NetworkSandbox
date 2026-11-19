@@ -142,11 +142,13 @@ pub struct FortiOs {
     frames: Vec<Frame>,
     /// Edits not yet applied; created on the first change, applied on next/end.
     draft: Option<Config>,
+    /// Running revision the draft was copied from.
+    base: u64,
 }
 
 impl FortiOs {
     pub fn new() -> FortiOs {
-        FortiOs { vdom: "root".into(), frames: Vec::new(), draft: None }
+        FortiOs { vdom: "root".into(), frames: Vec::new(), draft: None, base: 0 }
     }
 }
 
@@ -226,6 +228,7 @@ impl FortiOs {
 
     fn draft<'s>(&'s mut self, ctx: &Ctx<'_>) -> &'s mut Config {
         if self.draft.is_none() {
+            self.base = ctx.store.revision();
             self.draft = Some(ctx.store.running());
         }
         self.draft.as_mut().expect("just set")
@@ -233,7 +236,7 @@ impl FortiOs {
 
     fn apply(&mut self, ctx: &Ctx<'_>) -> R {
         let Some(draft) = self.draft.take() else { return Ok(String::new()) };
-        ctx.store.commit(&draft).map(|()| String::new())
+        ctx.store.commit_from(self.base, &draft).map(|()| String::new())
     }
 
     fn dispatch(&mut self, w: &[String], ctx: &Ctx<'_>) -> R {
@@ -1736,5 +1739,23 @@ interface port3 zone port3 address 10.1.0.1/24
         assert!(s.exec("config firewall policy", &ctx).is_empty());
         assert!(s.exec("edit 0", &ctx).contains("Permission denied"));
         assert!(s.exec("show", &ctx).contains("config firewall policy"));
+    }
+
+    #[test]
+    fn c9_draft_older_than_running_is_refused_on_next() {
+        let engine = crate::dataplane::Engine::for_test_with_file(Config::parse(BASE).unwrap());
+        let ctx = crate::style::Ctx { store: &engine, can_write: true };
+        let mut s = FortiOs::new();
+        for line in ["config firewall policy", "edit 7", "set srcintf port1", "set dstintf port2", "set srcaddr all", "set dstaddr all", "set action accept"] {
+            let out = s.exec(line, &ctx);
+            assert!(out.is_empty(), "{line}: {out}");
+        }
+        let mut other = engine.cfg.read().unwrap().clone();
+        other.settings.hostname = "changed-elsewhere".into();
+        engine.apply_config(&other).unwrap();
+        let out = s.exec("next", &ctx);
+        assert!(out.contains("changed since"), "{out}");
+        assert!(engine.cfg.read().unwrap().policies.iter().all(|p| p.id != 7), "stale draft not applied");
+        assert_eq!(engine.cfg.read().unwrap().settings.hostname, "changed-elsewhere");
     }
 }

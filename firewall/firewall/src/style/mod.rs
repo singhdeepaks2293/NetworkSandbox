@@ -26,6 +26,18 @@ use std::collections::HashMap;
 pub trait Store {
     fn running(&self) -> Config;
     fn commit(&self, next: &Config) -> Result<(), String>;
+    /// Revision of the running configuration, bumped by every commit. Read
+    /// it *before* `running()` when starting an edit.
+    fn revision(&self) -> u64 {
+        0
+    }
+    /// Commit an edit that started from revision `base`; refused when
+    /// another commit landed since, so concurrent sessions cannot silently
+    /// overwrite each other.
+    fn commit_from(&self, base: u64, next: &Config) -> Result<(), String> {
+        let _ = base;
+        self.commit(next)
+    }
     fn sessions(&self) -> Vec<Session>;
     fn hits(&self) -> HashMap<(String, u32), (u64, u64, u64)>;
     fn user_login(&self, ip: std::net::Ipv4Addr, user: &str, timeout_secs: Option<u64>) -> Result<(), String>;
@@ -43,6 +55,12 @@ impl Store for crate::dataplane::Engine {
     }
     fn commit(&self, next: &Config) -> Result<(), String> {
         self.apply_config(next)
+    }
+    fn revision(&self) -> u64 {
+        self.config_revision()
+    }
+    fn commit_from(&self, base: u64, next: &Config) -> Result<(), String> {
+        self.apply_config_from(base, next)
     }
     fn sessions(&self) -> Vec<Session> {
         self.sessions.lock().unwrap().snapshot()

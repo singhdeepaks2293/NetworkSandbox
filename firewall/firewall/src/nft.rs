@@ -5,11 +5,21 @@
 //! table in a single nfnetlink batch so a rejected configuration cannot leave
 //! a partially installed ruleset behind. The userspace dataplane remains the
 //! default path; callers opt into kernel enforcement explicitly.
+//!
+//! Exactness: [`kernel_problems`] refuses any configuration the kernel cannot
+//! enforce *exactly*. Nothing is translated into a looser rule: a permit that
+//! needs inspection, a user-scoped rule, or a deny whose IPv6 part or service
+//! cannot be represented makes the whole plan fail with the reasons.
+//!
+//! Verification: every rule carries the comment `vela:<generation>:<index>`
+//! (nftables user data). After an apply, [`read_back`] dumps the table over netlink and
+//! [`verify`] compares chains, hooks, policies and every rule tag in order, so
+//! a missing, extra (foreign), reordered or replaced rule is detected.
 
 use crate::model::{Action, AddrRef, Cidr, Config, DnatRule, Policy, Proto, SnatTarget, APPLICATION_DEFAULT};
 use netlink_packet_core::{
     DefaultNla, NetlinkHeader, NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_APPEND,
-    NLM_F_CREATE, NLM_F_REQUEST,
+    NLM_F_CREATE, NLM_F_DUMP, NLM_F_REQUEST,
 };
 use netlink_packet_netfilter::nftables::{
     Bitwise, ChainAttribute, ChainMessage, Cmp, DataAttribute, ExpressionAttribute, Expressions,
@@ -63,7 +73,84 @@ pub struct PlanSummary {
 
 /// Build the complete replacement batch for the dedicated `vela` table.
 pub fn plan(cfg: &Config) -> Result<Vec<NfTablesMessage>, String> {
-    plan_inner(cfg)
+    plan_tagged(cfg).map(|(messages, _)| messages)
+}
+
+/// What a verified install must look like in the kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expected {
+    /// Fingerprint of the planned ruleset; part of every rule tag.
+    pub generation: u64,
+    /// (name, hook number, policy) of each base chain.
+    pub chains: Vec<(String, u32, u32)>,
+    /// (chain, tag) of every rule, in installation order.
+    pub rules: Vec<(String, Vec<u8>)>,
+}
+
+/// A chain as read back from the kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActualChain {
+    pub table: String,
+    pub name: String,
+    pub hook: Option<u32>,
+    pub policy: Option<u32>,
+}
+
+/// A rule as read back from the kernel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActualRule {
+    pub table: String,
+    pub chain: String,
+    pub userdata: Option<Vec<u8>>,
+}
+
+/// Plan plus the state verification expects. Refuses configurations the
+/// kernel cannot enforce exactly (see [`kernel_problems`]).
+pub fn plan_tagged(cfg: &Config) -> Result<(Vec<NfTablesMessage>, Expected), String> {
+    let problems = kernel_problems(cfg);
+    if !problems.is_empty() {
+        return Err(format!(
+            "the kernel dataplane cannot enforce this configuration exactly:\n  {}",
+            problems.join("\n  ")
+        ));
+    }
+    let mut messages = plan_inner(cfg)?;
+    let generation = fnv64(format!("{messages:?}").as_bytes());
+    let mut expected = Expected { generation, chains: Vec::new(), rules: Vec::new() };
+    let mut index = 0usize;
+    for message in &mut messages {
+        match message {
+            NfTablesMessage::NewChain(ChainMessage { attributes }) => {
+                let name = attributes.iter().find_map(|a| match a { ChainAttribute::Name(n) => Some(n.clone()), _ => None });
+                let policy = attributes.iter().find_map(|a| match a { ChainAttribute::Policy(p) => Some(*p), _ => None });
+                let hook = attributes.iter().find_map(|a| match a {
+                    ChainAttribute::Hook(h) => h.iter().find_map(|x| match x { Hook::Number(n) => Some(*n), _ => None }),
+                    _ => None,
+                });
+                if let (Some(name), Some(policy), Some(hook)) = (name, policy, hook) {
+                    expected.chains.push((name, hook.into(), policy));
+                }
+            }
+            NfTablesMessage::NewRule(RuleMessage { attributes }) => {
+                let chain = attributes
+                    .iter()
+                    .find_map(|a| match a { RuleAttribute::Chain(c) => Some(c.clone()), _ => None })
+                    .unwrap_or_default();
+                // Encoded as an nftables comment (udata TLV type 0, NUL
+                // terminated) so `nft list` shows it instead of choking on
+                // unknown user data.
+                let text = format!("vela:{generation:016x}:{index}");
+                let mut tag = vec![0u8, (text.len() + 1) as u8];
+                tag.extend_from_slice(text.as_bytes());
+                tag.push(0);
+                index += 1;
+                attributes.push(RuleAttribute::UserData(tag.clone()));
+                expected.rules.push((chain, tag));
+            }
+            _ => {}
+        }
+    }
+    Ok((messages, expected))
 }
 
 /// Apply the configuration with one atomic nfnetlink batch.
@@ -72,6 +159,353 @@ pub fn install(cfg: &Config) -> Result<PlanSummary, String> {
     let summary = summarize(&messages);
     send_batch(&messages)?;
     Ok(summary)
+}
+
+/// Apply, then read the table back and verify it matches exactly.
+pub fn install_verified(cfg: &Config) -> Result<Expected, String> {
+    let (messages, expected) = plan_tagged(cfg)?;
+    send_batch(&messages)?;
+    check_installed(&expected)?;
+    Ok(expected)
+}
+
+/// Read the table back and compare it with `expected`.
+pub fn check_installed(expected: &Expected) -> Result<(), String> {
+    let (chains, rules) = read_back()?;
+    verify(expected, &chains, &rules).map_err(|problems| problems.join("; "))
+}
+
+/// Fail-closed fallback when no verified ruleset can be installed: replace
+/// the table with a forward chain that drops everything. Local input and
+/// output stay open so the firewall remains manageable.
+pub fn install_lockdown() -> Result<(), String> {
+    send_batch(&[
+        destroy_table(),
+        new_table(),
+        chain("forward", "filter", InetHookNumber::Forward, 0, NF_DROP),
+    ])
+}
+
+/// The kernel enforcement path as the engine drives it. [`Netlink`] is the
+/// real implementation; tests substitute a fake.
+pub trait Backend: Send + Sync {
+    /// Refuse a configuration before anything touches the kernel.
+    fn validate(&self, cfg: &Config) -> Result<(), String> {
+        plan_tagged(cfg).map(|_| ())
+    }
+    /// Install `cfg` atomically and verify it by read-back.
+    fn apply(&self, cfg: &Config) -> Result<(), String>;
+    /// Verify that the last verified install is still in place.
+    fn check(&self) -> Result<(), String>;
+    /// Fail-closed fallback: drop all forwarded traffic.
+    fn lockdown(&self) -> Result<(), String>;
+}
+
+/// The real kernel backend: nfnetlink batches plus read-back verification.
+#[derive(Default)]
+pub struct Netlink {
+    expected: std::sync::Mutex<Option<Expected>>,
+}
+
+impl Backend for Netlink {
+    fn apply(&self, cfg: &Config) -> Result<(), String> {
+        let expected = install_verified(cfg)?;
+        *self.expected.lock().unwrap() = Some(expected);
+        Ok(())
+    }
+    fn check(&self) -> Result<(), String> {
+        match self.expected.lock().unwrap().as_ref() {
+            Some(expected) => check_installed(expected),
+            None => Err("no verified ruleset is installed".to_string()),
+        }
+    }
+    fn lockdown(&self) -> Result<(), String> {
+        *self.expected.lock().unwrap() = None;
+        install_lockdown()
+    }
+}
+
+/// Everything in `cfg` the kernel backend cannot enforce exactly. Each entry
+/// names the object and why; an empty list means the plan is exact.
+pub fn kernel_problems(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if cfg.ha.enabled {
+        out.push("ha: session synchronisation needs the userspace dataplane".to_string());
+    }
+    if !cfg.tunnels.is_empty() {
+        out.push("vpn: WireGuard tunnels need the userspace dataplane".to_string());
+    }
+    for zone in &cfg.zones {
+        if zone.syn_flood.is_some() || zone.udp_flood.is_some() || zone.icmp_flood.is_some() {
+            out.push(format!("zone {}: flood protection needs the userspace dataplane", zone.name));
+        }
+    }
+    if cfg.settings.source_rate > 0 {
+        out.push("system source-rate: per-source rate limiting needs the userspace dataplane".to_string());
+    }
+    let has_v6 = |list: &[AddrRef]| list.iter().any(|r| addr_has_v6(cfg, r, 0));
+    for policy in cfg.policies.iter().filter(|p| p.enabled) {
+        let id = policy.id;
+        if let Err(e) = kernel_supported(cfg, policy) {
+            out.push(e);
+            continue;
+        }
+        let scoped_users = !(policy.users.is_empty() || policy.users.iter().any(|u| u == "any"));
+        if scoped_users {
+            out.push(format!("policy {id}: user-scoped rules need User-ID, which only the userspace engine enforces"));
+        }
+        if policy.action == Action::Permit {
+            for (what, set) in [
+                ("url", policy.url.is_some()),
+                ("ips", policy.ips.is_some()),
+                ("av", policy.av.is_some()),
+                ("shaper", policy.shaper.is_some()),
+                ("profile group", policy.group.is_some()),
+            ] {
+                if set {
+                    out.push(format!("policy {id}: the {what} profile needs inspection, which only the userspace engine performs"));
+                }
+            }
+        } else {
+            // Dropping any part of a deny would widen access.
+            if has_v6(&policy.src) || has_v6(&policy.dst) {
+                out.push(format!("policy {id}: IPv6 addresses in a deny are not translated, so the deny would be incomplete"));
+            }
+            if selectors(cfg, policy).is_none() {
+                out.push(format!("policy {id}: its services cannot be represented, so the deny would be skipped"));
+            }
+        }
+    }
+    out
+}
+
+fn addr_has_v6(cfg: &Config, reference: &AddrRef, depth: usize) -> bool {
+    if depth > 16 {
+        return true;
+    }
+    match reference {
+        AddrRef::Cidr(_) => false,
+        AddrRef::Cidr6(_) => true,
+        AddrRef::Named(name) => {
+            if let Some(object) = cfg.addresses.iter().find(|a| &a.name == name) {
+                return !object.entries6.is_empty();
+            }
+            cfg.address_groups
+                .iter()
+                .find(|g| &g.name == name)
+                .is_some_and(|g| g.members.iter().any(|m| addr_has_v6(cfg, &AddrRef::Named(m.clone()), depth + 1)))
+        }
+    }
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Compare the read-back table with what was installed. Every difference is
+/// reported: missing or extra chains, a changed hook or policy, and per
+/// chain any missing, foreign, reordered or replaced rule.
+pub fn verify(expected: &Expected, chains: &[ActualChain], rules: &[ActualRule]) -> Result<(), Vec<String>> {
+    let mut problems = Vec::new();
+    let ours: Vec<&ActualChain> = chains.iter().filter(|c| c.table == TABLE).collect();
+    if ours.is_empty() && !expected.chains.is_empty() {
+        return Err(vec![format!("table inet {TABLE} is missing or empty")]);
+    }
+    for (name, hook, policy) in &expected.chains {
+        match ours.iter().find(|c| &c.name == name) {
+            None => problems.push(format!("chain {name}: missing")),
+            Some(c) => {
+                if c.hook != Some(*hook) {
+                    problems.push(format!("chain {name}: hook changed ({:?}, expected {hook})", c.hook));
+                }
+                if c.policy != Some(*policy) {
+                    problems.push(format!("chain {name}: policy changed ({:?}, expected {policy})", c.policy));
+                }
+            }
+        }
+    }
+    for c in &ours {
+        if !expected.chains.iter().any(|(n, _, _)| n == &c.name) {
+            problems.push(format!("chain {}: not installed by the firewall", c.name));
+        }
+    }
+    let mut names: Vec<&str> = expected.rules.iter().map(|(c, _)| c.as_str()).collect();
+    names.extend(rules.iter().filter(|r| r.table == TABLE).map(|r| r.chain.as_str()));
+    names.sort();
+    names.dedup();
+    for chain in names {
+        let want: Vec<&[u8]> = expected.rules.iter().filter(|(c, _)| c == chain).map(|(_, t)| t.as_slice()).collect();
+        let have: Vec<Option<&[u8]>> = rules
+            .iter()
+            .filter(|r| r.table == TABLE && r.chain == chain)
+            .map(|r| r.userdata.as_deref())
+            .collect();
+        let foreign = have.iter().filter(|t| !t.is_some_and(|t| want.contains(&t))).count();
+        if foreign > 0 {
+            problems.push(format!("chain {chain}: {foreign} rule(s) not installed by the firewall"));
+        }
+        let missing = want.iter().filter(|t| !have.contains(&Some(**t))).count();
+        if missing > 0 {
+            problems.push(format!("chain {chain}: {missing} installed rule(s) missing or replaced"));
+        }
+        if foreign == 0 && missing == 0 && have.iter().map(|t| t.unwrap()).collect::<Vec<_>>() != want {
+            problems.push(format!("chain {chain}: rules reordered"));
+        }
+    }
+    if problems.is_empty() { Ok(()) } else { Err(problems) }
+}
+
+// ------------------------------------------------------------- read-back
+
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const NFT_MSG_NEWCHAIN: u8 = 3;
+const NFT_MSG_GETCHAIN: u8 = 4;
+const NFT_MSG_NEWRULE: u8 = 6;
+const NFT_MSG_GETRULE: u8 = 7;
+const NFTA_CHAIN_TABLE: u16 = 1;
+const NFTA_CHAIN_NAME: u16 = 3;
+const NFTA_CHAIN_HOOK: u16 = 4;
+const NFTA_CHAIN_POLICY: u16 = 5;
+const NFTA_HOOK_HOOKNUM: u16 = 1;
+const NFTA_RULE_TABLE: u16 = 1;
+const NFTA_RULE_CHAIN: u16 = 2;
+const NFTA_RULE_USERDATA: u16 = 7;
+const NFPROTO_INET: u8 = 1;
+
+/// Dump the chains and rules of the owned table.
+pub fn read_back() -> Result<(Vec<ActualChain>, Vec<ActualRule>), String> {
+    let chains = dump(NFT_MSG_GETCHAIN, NFTA_CHAIN_TABLE)?
+        .iter()
+        .filter_map(|(t, body)| (*t == NFT_MSG_NEWCHAIN).then(|| parse_chain(body)))
+        .collect();
+    let rules = dump(NFT_MSG_GETRULE, NFTA_RULE_TABLE)?
+        .iter()
+        .filter_map(|(t, body)| (*t == NFT_MSG_NEWRULE).then(|| parse_rule(body)))
+        .collect();
+    Ok((chains, rules))
+}
+
+/// Attributes of one netlink message body (after the 4-byte nfgenmsg).
+fn nlas(body: &[u8]) -> Vec<(u16, &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= body.len() {
+        let len = u16::from_ne_bytes([body[at], body[at + 1]]) as usize;
+        let kind = u16::from_ne_bytes([body[at + 2], body[at + 3]]) & 0x3fff;
+        if len < 4 || at + len > body.len() {
+            break;
+        }
+        out.push((kind, &body[at + 4..at + len]));
+        at += (len + 3) & !3;
+    }
+    out
+}
+
+fn nla_string(data: &[u8]) -> String {
+    String::from_utf8_lossy(data.split(|b| *b == 0).next().unwrap_or(&[])).into_owned()
+}
+
+fn nla_be32(data: &[u8]) -> Option<u32> {
+    data.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn parse_chain(body: &[u8]) -> ActualChain {
+    let mut c = ActualChain { table: String::new(), name: String::new(), hook: None, policy: None };
+    for (kind, data) in nlas(body.get(4..).unwrap_or(&[])) {
+        match kind {
+            NFTA_CHAIN_TABLE => c.table = nla_string(data),
+            NFTA_CHAIN_NAME => c.name = nla_string(data),
+            NFTA_CHAIN_POLICY => c.policy = nla_be32(data),
+            NFTA_CHAIN_HOOK => {
+                c.hook = nlas(data).into_iter().find(|(k, _)| *k == NFTA_HOOK_HOOKNUM).and_then(|(_, d)| nla_be32(d))
+            }
+            _ => {}
+        }
+    }
+    c
+}
+
+fn parse_rule(body: &[u8]) -> ActualRule {
+    let mut r = ActualRule { table: String::new(), chain: String::new(), userdata: None };
+    for (kind, data) in nlas(body.get(4..).unwrap_or(&[])) {
+        match kind {
+            NFTA_RULE_TABLE => r.table = nla_string(data),
+            NFTA_RULE_CHAIN => r.chain = nla_string(data),
+            NFTA_RULE_USERDATA => r.userdata = Some(data.to_vec()),
+            _ => {}
+        }
+    }
+    r
+}
+
+/// Split a receive buffer into (nftables message type, body) pairs. Returns
+/// `Ok(true)` once NLMSG_DONE is seen.
+fn split_dump(buf: &[u8], out: &mut Vec<(u8, Vec<u8>)>) -> Result<bool, String> {
+    let mut at = 0usize;
+    while at + 16 <= buf.len() {
+        let len = u32::from_ne_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes([buf[at + 4], buf[at + 5]]);
+        if len < 16 || at + len > buf.len() {
+            return Err(format!("malformed netlink message ({len} bytes at offset {at})"));
+        }
+        match kind {
+            NLMSG_DONE => return Ok(true),
+            NLMSG_ERROR => {
+                let code = buf.get(at + 16..at + 20).map(|b| i32::from_ne_bytes(b.try_into().unwrap())).unwrap_or(0);
+                if code != 0 {
+                    return Err(format!("nftables dump: {}", std::io::Error::from_raw_os_error(-code)));
+                }
+            }
+            _ if kind >> 8 == NFNL_SUBSYS_NFTABLES => out.push(((kind & 0xff) as u8, buf[at + 16..at + len].to_vec())),
+            _ => {}
+        }
+        at += (len + 3) & !3;
+    }
+    Ok(false)
+}
+
+fn dump(message_type: u8, table_attr: u16) -> Result<Vec<(u8, Vec<u8>)>, String> {
+    let socket = open_socket()?;
+    let mut name = TABLE.as_bytes().to_vec();
+    name.push(0);
+    let attr_len = 4 + name.len();
+    let total = 16 + 4 + ((attr_len + 3) & !3);
+    let mut req = Vec::with_capacity(total);
+    req.extend_from_slice(&(total as u32).to_ne_bytes());
+    req.extend_from_slice(&((NFNL_SUBSYS_NFTABLES << 8) | u16::from(message_type)).to_ne_bytes());
+    req.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    req.extend_from_slice(&2u32.to_ne_bytes());
+    req.extend_from_slice(&0u32.to_ne_bytes());
+    req.extend_from_slice(&[NFPROTO_INET, 0, 0, 0]);
+    req.extend_from_slice(&(attr_len as u16).to_ne_bytes());
+    req.extend_from_slice(&table_attr.to_ne_bytes());
+    req.extend_from_slice(&name);
+    req.resize(total, 0);
+    socket.send(&req, 0).map_err(|e| format!("send nftables dump request: {e}"))?;
+    let mut out = Vec::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    for _ in 0..100_000 {
+        let mut receive = &mut buffer[..];
+        let size = socket.recv(&mut receive, 0).map_err(|e| format!("read nftables dump: {e}"))?;
+        if split_dump(&buffer[..size], &mut out)? {
+            return Ok(out);
+        }
+    }
+    Err("nftables dump did not terminate".into())
+}
+
+fn open_socket() -> Result<Socket, String> {
+    let mut socket = Socket::new(NETLINK_NETFILTER).map_err(|e| format!("open netfilter socket: {e}"))?;
+    socket.bind_auto().map_err(|e| format!("bind netfilter socket: {e}"))?;
+    socket.connect(&SocketAddr::new(0, 0)).map_err(|e| format!("connect netfilter socket: {e}"))?;
+    set_receive_timeout(socket.as_raw_fd())?;
+    Ok(socket)
 }
 
 /// Remove only the table owned by this backend.
@@ -695,15 +1129,7 @@ fn be32(value: u32) -> Vec<u8> {
 }
 
 fn send_batch(messages: &[NfTablesMessage]) -> Result<(), String> {
-    let mut socket =
-        Socket::new(NETLINK_NETFILTER).map_err(|e| format!("open netfilter socket: {e}"))?;
-    socket
-        .bind_auto()
-        .map_err(|e| format!("bind netfilter socket: {e}"))?;
-    socket
-        .connect(&SocketAddr::new(0, 0))
-        .map_err(|e| format!("connect netfilter socket: {e}"))?;
-    set_receive_timeout(socket.as_raw_fd())?;
+    let socket = open_socket()?;
 
     let seq = 1u32;
     let mut payload = Vec::new();
@@ -928,5 +1354,184 @@ mod tests {
         let debug = format!("{exprs:?}");
         assert!(debug.contains("bitwise"));
         assert!(debug.contains("cmp"));
+    }
+
+    // ---------------------------------------------- Stage 2: exactness,
+    // tagging, read-back parsing and verification.
+
+    fn two_zone(extra: &str) -> Config {
+        Config::parse(&format!(
+            "interface eth0 zone lan address 192.0.2.1/24\n\
+             interface eth1 zone wan address 198.51.100.1/24\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_configs_have_no_kernel_problems() {
+        let cfg = two_zone("policy 10 lan wan any any tcp 443 permit\npolicy 20 lan wan any 203.0.113.0/24 any any deny\n");
+        assert!(kernel_problems(&cfg).is_empty(), "{:?}", kernel_problems(&cfg));
+        assert!(plan_tagged(&cfg).is_ok());
+    }
+
+    #[test]
+    fn inspection_profiles_are_refused_not_weakened() {
+        let cfg = two_zone("url-filter corp block example.com\npolicy 10 lan wan any any tcp any permit url corp\n");
+        let p = kernel_problems(&cfg);
+        assert!(p.iter().any(|x| x.contains("policy 10") && x.contains("url")), "{p:?}");
+        let err = plan_tagged(&cfg).unwrap_err();
+        assert!(err.contains("cannot enforce this configuration exactly"), "{err}");
+    }
+
+    #[test]
+    fn user_scoped_rules_are_refused() {
+        let cfg = two_zone("policy 10 lan wan any any tcp any permit user alice\n");
+        assert!(kernel_problems(&cfg).iter().any(|x| x.contains("User-ID")));
+    }
+
+    #[test]
+    fn deny_with_ipv6_parts_is_refused_because_it_would_widen() {
+        let cfg = two_zone("policy 10 lan wan any 2001:db8::/32 any any deny\npolicy 20 lan wan any any any any permit\n");
+        let p = kernel_problems(&cfg);
+        assert!(p.iter().any(|x| x.contains("policy 10") && x.contains("IPv6")), "{p:?}");
+        // The same through a named object.
+        let cfg = two_zone("address v6net 2001:db8::/32\npolicy 10 lan wan any @v6net any any deny\n");
+        assert!(kernel_problems(&cfg).iter().any(|x| x.contains("IPv6")));
+        // A permit with an IPv6 part only narrows, so it is allowed.
+        let cfg = two_zone("policy 10 lan wan any 2001:db8::/32 any any permit\n");
+        assert!(kernel_problems(&cfg).is_empty());
+    }
+
+    #[test]
+    fn deny_with_unrepresentable_service_is_refused() {
+        let cfg = two_zone("service dns udp 53\npolicy 1 lan wan any any tcp @dns deny\n");
+        assert!(kernel_problems(&cfg).iter().any(|x| x.contains("would be skipped")));
+    }
+
+    #[test]
+    fn userspace_only_features_are_refused() {
+        let cfg = two_zone("zone lan syn-flood 100\n");
+        assert!(kernel_problems(&cfg).iter().any(|x| x.contains("flood")));
+        let cfg = two_zone("system source-rate 100\nsystem source-burst 100\n");
+        assert!(kernel_problems(&cfg).iter().any(|x| x.contains("source-rate")));
+    }
+
+    #[test]
+    fn every_rule_gets_a_unique_generation_tag() {
+        let cfg = two_zone("policy 10 lan wan any any tcp 443 permit\npolicy 20 lan wan any any udp 53 permit\n");
+        let (messages, expected) = plan_tagged(&cfg).unwrap();
+        let rules = messages.iter().filter(|m| matches!(m, NfTablesMessage::NewRule(_))).count();
+        assert_eq!(expected.rules.len(), rules);
+        let mut tags: Vec<_> = expected.rules.iter().map(|(_, t)| t.clone()).collect();
+        tags.sort();
+        tags.dedup();
+        assert_eq!(tags.len(), rules, "tags are unique");
+        let prefix = format!("vela:{:016x}:", expected.generation);
+        assert!(expected.rules.iter().all(|(_, t)| t[0] == 0 && usize::from(t[1]) == t.len() - 2 && t[2..].starts_with(prefix.as_bytes()) && *t.last().unwrap() == 0),
+            "comment TLV: type 0, length, NUL-terminated text");
+        assert_eq!(expected.chains.len(), 5);
+        // Same configuration, same generation; a change gives a new one.
+        assert_eq!(plan_tagged(&cfg).unwrap().1.generation, expected.generation);
+        let other = two_zone("policy 10 lan wan any any tcp 8443 permit\n");
+        assert_ne!(plan_tagged(&other).unwrap().1.generation, expected.generation);
+    }
+
+    /// Serialize a planned message the way the kernel sends it in a dump.
+    fn as_dump_reply(message: &NfTablesMessage) -> Vec<u8> {
+        let mut header = NetlinkHeader::default();
+        header.flags = 2; // NLM_F_MULTI
+        let mut packet = NetlinkMessage::new(
+            header,
+            NetlinkPayload::from(NetfilterMessage::new(NetfilterHeader::new(NetfilterProtoFamily::Inet, 0, 0), message.clone())),
+        );
+        packet.finalize();
+        let mut bytes = vec![0u8; packet.buffer_len()];
+        packet.serialize(&mut bytes);
+        bytes
+    }
+
+    fn done() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&20u32.to_ne_bytes());
+        b.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
+        b.extend_from_slice(&[0u8; 14]);
+        b
+    }
+
+    /// What the kernel would return for a correct install of `expected`.
+    fn readback_of(messages: &[NfTablesMessage]) -> (Vec<ActualChain>, Vec<ActualRule>) {
+        let mut buf = Vec::new();
+        for m in messages {
+            if matches!(m, NfTablesMessage::NewChain(_) | NfTablesMessage::NewRule(_)) {
+                buf.extend(as_dump_reply(m));
+            }
+        }
+        buf.extend(done());
+        let mut out = Vec::new();
+        assert!(split_dump(&buf, &mut out).unwrap(), "NLMSG_DONE ends the dump");
+        let chains = out.iter().filter(|(t, _)| *t == NFT_MSG_NEWCHAIN).map(|(_, b)| parse_chain(b)).collect();
+        let rules = out.iter().filter(|(t, _)| *t == NFT_MSG_NEWRULE).map(|(_, b)| parse_rule(b)).collect();
+        (chains, rules)
+    }
+
+    #[test]
+    fn dump_replies_parse_back_to_tables_chains_hooks_and_tags() {
+        let cfg = two_zone("policy 10 lan wan any any tcp 443 permit\n");
+        let (messages, expected) = plan_tagged(&cfg).unwrap();
+        let (chains, rules) = readback_of(&messages);
+        assert_eq!(chains.len(), 5);
+        let fwd = chains.iter().find(|c| c.name == "forward").unwrap();
+        assert_eq!((fwd.table.as_str(), fwd.policy), (TABLE, Some(NF_DROP)));
+        assert_eq!(fwd.hook, Some(u32::from(InetHookNumber::Forward)));
+        assert_eq!(rules.len(), expected.rules.len());
+        assert_eq!(rules[0].userdata.as_deref(), Some(expected.rules[0].1.as_slice()));
+        verify(&expected, &chains, &rules).unwrap();
+    }
+
+    #[test]
+    fn dump_error_replies_are_reported() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&36u32.to_ne_bytes());
+        b.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        b.extend_from_slice(&[0u8; 10]);
+        b.extend_from_slice(&(-2i32).to_ne_bytes()); // -ENOENT
+        b.extend_from_slice(&[0u8; 16]);
+        let err = split_dump(&b, &mut Vec::new()).unwrap_err();
+        assert!(err.contains("No such file"), "{err}");
+        assert!(split_dump(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut Vec::new()).is_err(), "bad length");
+    }
+
+    #[test]
+    fn verify_detects_missing_foreign_reordered_and_changed_state() {
+        let cfg = two_zone("policy 10 lan wan any any tcp 443 permit\npolicy 20 lan wan any any udp 53 permit\n");
+        let (messages, expected) = plan_tagged(&cfg).unwrap();
+        let (chains, rules) = readback_of(&messages);
+        let forward: Vec<usize> = rules.iter().enumerate().filter(|(_, r)| r.chain == "forward").map(|(i, _)| i).collect();
+
+        let mut missing = rules.clone();
+        missing.remove(*forward.last().unwrap());
+        assert!(verify(&expected, &chains, &missing).unwrap_err().iter().any(|p| p.contains("missing")));
+
+        let mut foreign = rules.clone();
+        foreign.insert(forward[0], ActualRule { table: TABLE.into(), chain: "forward".into(), userdata: None });
+        assert!(verify(&expected, &chains, &foreign).unwrap_err().iter().any(|p| p.contains("not installed by the firewall")));
+
+        let mut reordered = rules.clone();
+        reordered.swap(forward[0], *forward.last().unwrap());
+        assert!(verify(&expected, &chains, &reordered).unwrap_err().iter().any(|p| p.contains("reordered")));
+
+        let mut opened = chains.clone();
+        opened.iter_mut().find(|c| c.name == "forward").unwrap().policy = Some(NF_ACCEPT);
+        assert!(verify(&expected, &opened, &rules).unwrap_err().iter().any(|p| p.contains("policy changed")));
+
+        let mut extra = chains.clone();
+        extra.push(ActualChain { table: TABLE.into(), name: "sneaky".into(), hook: Some(2), policy: Some(NF_ACCEPT) });
+        assert!(verify(&expected, &extra, &rules).is_err());
+
+        assert!(verify(&expected, &[], &[]).unwrap_err()[0].contains("missing"));
+        // Another table's rules are not ours to judge.
+        let mut other = rules.clone();
+        other.push(ActualRule { table: "filter".into(), chain: "forward".into(), userdata: None });
+        verify(&expected, &chains, &other).unwrap();
     }
 }

@@ -181,6 +181,10 @@ pub struct Session {
     pub app_seq: [Option<u32>; 2],
     /// Source user from User-ID when the flow started.
     pub user: Option<String>,
+    /// Configuration revision this session's policy decision was last
+    /// checked against. A session from an older revision is re-evaluated
+    /// against the current rulebase before its next packet is forwarded.
+    pub rev: u64,
 }
 
 /// Result of classifying a pending flow.
@@ -274,6 +278,13 @@ impl Sessions {
         };
         s.expires = Instant::now() + Duration::from_secs(secs);
         true
+    }
+
+    /// Mark a session as checked against configuration revision `rev`.
+    pub fn set_rev(&mut self, key: &SessionKey, rev: u64) {
+        if let Some(s) = self.forward.get_mut(key) {
+            s.rev = rev;
+        }
     }
 
     /// Record App-ID's verdict and the policy now governing the flow.
@@ -477,6 +488,11 @@ pub struct Engine {
     pub hits: Mutex<HashMap<(String, u32), (u64, u64, u64)>>,
     /// Staged configuration text; it is not enforced until commit.
     pub candidate: Mutex<Option<String>>,
+    /// Configuration revision the staged candidate was based on.
+    candidate_base: Mutex<u64>,
+    /// Serializes commits so the base-revision check and the activation
+    /// are atomic with respect to each other.
+    commit_lock: Mutex<()>,
     /// Previous running configuration texts, oldest first.
     pub history: Mutex<Vec<String>>,
     pub revisions: Mutex<u64>,
@@ -486,6 +502,20 @@ pub struct Engine {
     pub ha_active: AtomicBool,
     /// HA: manually suspended (`ha suspend`).
     pub ha_suspended: AtomicBool,
+    /// Whether this process is expected to forward packets (false with
+    /// --dry-run / --no-dataplane, and in tests).
+    pub dataplane_expected: bool,
+    /// Set once the packet loop is running.
+    pub dataplane_running: AtomicBool,
+    /// Configured interfaces the dataplane could not attach to.
+    pub attach_problems: Mutex<Vec<String>>,
+    /// Kernel settings that would let traffic bypass the engine, refreshed
+    /// by the monitor thread (see `kernel_forwarding_problems`).
+    pub kernel_problems: Mutex<Vec<String>>,
+    /// Kernel (nftables) dataplane, when `system dataplane kernel`.
+    pub kernel: Option<Box<dyn crate::nft::Backend>>,
+    /// Why the kernel dataplane is not verified; `None` when it is.
+    pub kernel_state: Mutex<Option<String>>,
     pub ha: Mutex<crate::ha::Status>,
     /// IPv6 connection table and neighbor cache.
     pub sessions6: Mutex<v6::Sessions6>,
@@ -513,6 +543,7 @@ impl Engine {
         let mut by_index = HashMap::new();
         // Container runtimes create the node's link interfaces shortly after
         // the process starts, so give them a few seconds to appear.
+        let mut attach_problems: Vec<String> = Vec::new();
         let mut missing: Vec<&Interface> = snapshot.interfaces.iter().filter(|i| !i.tunnel).collect();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -536,6 +567,7 @@ impl Engine {
                         Ok(fd) => fd,
                         Err(e) => {
                             eprintln!("dataplane: cannot open {}: {e}", iface.name);
+                            attach_problems.push(format!("interface {}: cannot open packet socket: {e}", iface.name));
                             continue;
                         }
                     }
@@ -564,6 +596,9 @@ impl Engine {
                 "dataplane: interface '{}' not found (configured for zone {}), skipping",
                 iface.name, iface.zone
             );
+            if !dry_run {
+                attach_problems.push(format!("interface {}: not found (zone {})", iface.name, iface.zone));
+            }
         }
         // WireGuard interfaces are virtual slots.
         for (n, iface) in snapshot.interfaces.iter().filter(|i| i.tunnel).enumerate() {
@@ -603,11 +638,19 @@ impl Engine {
             logs: Mutex::new(VecDeque::new()),
             hits: Mutex::new(HashMap::new()),
             candidate: Mutex::new(None),
+            candidate_base: Mutex::new(0),
+            commit_lock: Mutex::new(()),
             history: Mutex::new(Vec::new()),
             revisions: Mutex::new(1),
             users: Mutex::new(HashMap::new()),
             ha_active: AtomicBool::new(true),
             ha_suspended: AtomicBool::new(false),
+            dataplane_expected: !dry_run,
+            dataplane_running: AtomicBool::new(false),
+            attach_problems: Mutex::new(attach_problems),
+            kernel_problems: Mutex::new(Vec::new()),
+            kernel: None,
+            kernel_state: Mutex::new(Some("kernel ruleset not installed yet".to_string())),
             ha: Mutex::new(crate::ha::Status::default()),
             vpn: Mutex::new(devices(&snapshot)),
             inject: Mutex::new(Vec::new()),
@@ -654,6 +697,147 @@ impl Engine {
                 AppVerdict::Denied(other, app.to_string())
             }
         }
+    }
+
+    /// Everything that currently stops this firewall from enforcing its
+    /// policy on every configured interface. Empty means healthy.
+    pub fn enforcement_problems(&self) -> Vec<String> {
+        if self.kernel.is_some() {
+            let mut out: Vec<String> = self.kernel_state.lock().unwrap().iter().cloned().collect();
+            out.extend(self.kernel_problems.lock().unwrap().iter().cloned());
+            return out;
+        }
+        if !self.dataplane_expected {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.dataplane_running.load(Ordering::SeqCst) {
+            out.push("dataplane: packet loop is not running".to_string());
+        }
+        out.extend(self.attach_problems.lock().unwrap().iter().cloned());
+        out.extend(self.kernel_problems.lock().unwrap().iter().cloned());
+        out
+    }
+
+    /// `off`, `enforcing` (userspace), `kernel` (verified nftables) or `degraded`.
+    pub fn dataplane_status(&self) -> &'static str {
+        let healthy = self.enforcement_problems().is_empty();
+        match (self.kernel.is_some(), self.dataplane_expected, healthy) {
+            (true, _, true) => "kernel",
+            (false, false, _) => "off",
+            (false, true, true) => "enforcing",
+            _ => "degraded",
+        }
+    }
+
+    /// Kernel mode: install `next`, verified. If that fails, restore `prev`
+    /// (verified); if that fails too, lock forwarding down and report
+    /// degraded. A configuration the kernel cannot enforce exactly is refused
+    /// before the kernel is touched. Userspace mode: nothing to do.
+    fn kernel_apply(&self, next: &Config, prev: &Config) -> Result<(), String> {
+        let Some(k) = &self.kernel else { return Ok(()) };
+        k.validate(next)?;
+        let Err(e) = k.apply(next) else {
+            *self.kernel_state.lock().unwrap() = None;
+            return Ok(());
+        };
+        match k.apply(prev) {
+            Ok(()) => {
+                *self.kernel_state.lock().unwrap() = None;
+                Err(format!("kernel dataplane: {e}; the previous ruleset was restored and verified"))
+            }
+            Err(e2) => {
+                let lock = k.lockdown();
+                let msg = format!(
+                    "kernel dataplane: {e}; restoring the previous ruleset failed ({e2}); {}",
+                    if lock.is_ok() { "forwarding is locked down (drop all)" } else { "lockdown also failed" }
+                );
+                *self.kernel_state.lock().unwrap() = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Kernel mode, at startup: install and verify the running configuration,
+    /// or lock forwarding down and fail.
+    pub fn kernel_start(&self) -> Result<(), String> {
+        let Some(k) = &self.kernel else { return Ok(()) };
+        let cfg = self.cfg.read().unwrap().clone();
+        match k.validate(&cfg).and_then(|()| k.apply(&cfg)) {
+            Ok(()) => {
+                *self.kernel_state.lock().unwrap() = None;
+                Ok(())
+            }
+            Err(e) => {
+                let lock = k.lockdown();
+                let msg = format!(
+                    "kernel dataplane: {e}; {}",
+                    if lock.is_ok() { "forwarding is locked down (drop all)" } else { "lockdown also failed" }
+                );
+                *self.kernel_state.lock().unwrap() = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Kernel mode, periodically: verify the installed ruleset; on drift
+    /// (an external change), reinstall the running configuration. Returns a
+    /// message when something happened, for the log.
+    pub fn kernel_reconcile(&self) -> Option<String> {
+        let k = self.kernel.as_ref()?;
+        let _commit = self.commit_lock.lock().unwrap();
+        let drift = match k.check() {
+            Ok(()) => return None,
+            Err(e) => e,
+        };
+        let cfg = self.cfg.read().unwrap().clone();
+        match k.apply(&cfg) {
+            Ok(()) => {
+                *self.kernel_state.lock().unwrap() = None;
+                Some(format!("kernel dataplane drift detected ({drift}); running ruleset reinstalled and verified"))
+            }
+            Err(e) => {
+                let lock = k.lockdown();
+                let msg = format!(
+                    "kernel dataplane drift detected ({drift}); reinstall failed ({e}); {}",
+                    if lock.is_ok() { "forwarding is locked down (drop all)" } else { "lockdown also failed" }
+                );
+                *self.kernel_state.lock().unwrap() = Some(msg.clone());
+                Some(msg)
+            }
+        }
+    }
+
+    /// Whether a session created under an older configuration revision is
+    /// still allowed by the current rulebase. The rulebase is re-run with the
+    /// same inputs App-ID uses (translated destination, original port, the
+    /// flow's zones, application and user); the session survives only if the
+    /// same policy still matches and permits it. Without this, narrowing a
+    /// policy or inserting a deny above it would leave flows that are already
+    /// open running until they time out.
+    fn session_still_permitted(&self, cfg: &Config, s: &Session) -> bool {
+        let rev = self.config_revision();
+        if s.rev == rev {
+            return true;
+        }
+        let dst = s.nat_dst.map(|(ip, _)| ip).unwrap_or(s.key.dst);
+        let ok = cfg
+            .match_or_default_user(
+                &s.key.vdom,
+                &s.src_zone,
+                &s.dst_zone,
+                s.key.src,
+                dst,
+                s.key.proto,
+                s.key.dport,
+                s.app.as_deref(),
+                s.user.as_deref(),
+            )
+            .is_some_and(|p| p.id == s.policy_id && p.action == Action::Permit);
+        if ok {
+            self.sessions.lock().unwrap().set_rev(&s.key, rev);
+        }
+        ok
     }
 
     /// Count a packet against a policy.
@@ -863,6 +1047,22 @@ impl Engine {
         self.save_text(&text)
     }
 
+    /// Activation order for every commit: kernel first (verified, restoring
+    /// the previous ruleset on failure), then disk. If saving fails, the
+    /// kernel is put back to the running configuration, so kernel, disk and
+    /// memory never disagree.
+    fn kernel_then_save(&self, parsed: &Config, text: &str) -> Result<(), String> {
+        let prev = self.cfg.read().unwrap().clone();
+        self.kernel_apply(parsed, &prev)?;
+        if let Err(e) = self.save_text(text) {
+            if self.kernel.is_some() {
+                let _ = self.kernel_apply(&prev, &prev);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn save_text(&self, text: &str) -> Result<(), String> {
         let Some(path) = &self.config_path else {
             return Err("no configuration file is attached".to_string());
@@ -879,6 +1079,9 @@ impl Engine {
     /// without reopening sockets, so they are rejected with a clear error.
     fn ensure_live_compatible(&self, next: &Config) -> Result<(), String> {
         let current = self.cfg.read().unwrap();
+        if current.settings.dataplane_kernel != next.settings.dataplane_kernel {
+            return Err("changing `system dataplane` requires a daemon restart".to_string());
+        }
         if current.interfaces.len() != next.interfaces.len() {
             return Err("interface additions/removals require a daemon restart".to_string());
         }
@@ -901,10 +1104,71 @@ impl Engine {
     }
 
     pub fn stage_config(&self, text: &str) -> Result<(), String> {
+        self.stage_config_from(None, text)
+    }
+
+    /// Stage a candidate edited from configuration revision `base` (the
+    /// revision the editor loaded). With `None` the candidate is based on the
+    /// revision current now. Staging an edit of an outdated revision is
+    /// refused, as is committing a candidate after another commit landed.
+    pub fn stage_config_from(&self, base: Option<u64>, text: &str) -> Result<(), String> {
+        let now = self.config_revision();
+        let base = base.unwrap_or(now);
+        if base != now {
+            return Err(stale(base, now));
+        }
         let parsed = Config::parse(text)?;
         self.ensure_live_compatible(&parsed)?;
         *self.candidate.lock().unwrap() = Some(text.to_string());
+        *self.candidate_base.lock().unwrap() = base;
         Ok(())
+    }
+
+    /// Revision the staged candidate is based on (the running revision when
+    /// nothing is staged).
+    pub fn candidate_base(&self) -> u64 {
+        if self.candidate.lock().unwrap().is_some() {
+            *self.candidate_base.lock().unwrap()
+        } else {
+            self.config_revision()
+        }
+    }
+
+    /// Apply structured object edits (from the GUI) to the candidate, or to a
+    /// fresh copy of the running configuration when nothing is staged. The
+    /// result is parsed and validated like any configuration, checked for
+    /// live compatibility and, in kernel mode, for exact kernel enforcement,
+    /// before it replaces the candidate. `client_base` is the revision the
+    /// client's view was based on; a stale view is refused.
+    pub fn edit_candidate(&self, client_base: Option<u64>, edits: &[crate::editor::Edit]) -> Result<(), String> {
+        let _commit = self.commit_lock.lock().unwrap();
+        let base = self.candidate_base();
+        if let Some(seen) = client_base {
+            if seen != base {
+                return Err(stale(seen, base));
+            }
+        }
+        let current = self.candidate_text().unwrap_or_else(|| self.running_text());
+        let canonical = Config::parse(&current)?.to_text();
+        let next = crate::editor::apply(&canonical, edits)?;
+        let parsed = Config::parse(&next)?;
+        self.ensure_live_compatible(&parsed)?;
+        if let Some(k) = &self.kernel {
+            k.validate(&parsed)?;
+        }
+        *self.candidate.lock().unwrap() = Some(parsed.to_text());
+        *self.candidate_base.lock().unwrap() = base;
+        Ok(())
+    }
+
+    /// Number of changed lines between running and candidate (0 when none).
+    pub fn pending_changes(&self) -> usize {
+        let Some(candidate) = self.candidate_text() else { return 0 };
+        let running = self.running_text();
+        crate::diff::unified(&running, &candidate, "running", "candidate")
+            .lines()
+            .filter(|l| (l.starts_with('+') && !l.starts_with("+++")) || (l.starts_with('-') && !l.starts_with("---")))
+            .count()
     }
 
     pub fn candidate_text(&self) -> Option<String> {
@@ -922,13 +1186,19 @@ impl Engine {
     }
 
     pub fn commit_candidate(&self) -> Result<(), String> {
+        let _commit = self.commit_lock.lock().unwrap();
         let text = self
             .candidate_text()
             .ok_or_else(|| "no candidate configuration is staged".to_string())?;
+        let base = *self.candidate_base.lock().unwrap();
+        let now = self.config_revision();
+        if base != now {
+            return Err(stale(base, now));
+        }
         let parsed = Config::parse(&text)?;
         self.ensure_live_compatible(&parsed)?;
         let old = self.cfg.read().unwrap().to_text();
-        self.save_text(&text)?;
+        self.kernel_then_save(&parsed, &text)?;
         self.backup(&old);
         *self.cfg.write().unwrap() = parsed;
         *self.candidate.lock().unwrap() = None;
@@ -986,6 +1256,23 @@ impl Engine {
     /// the FortiOS- and PAN-OS-style CLIs, which keep their own drafts and do
     /// not touch the GUI's staged candidate.
     pub fn apply_config(&self, next: &Config) -> Result<(), String> {
+        let _commit = self.commit_lock.lock().unwrap();
+        self.apply_config_locked(next)
+    }
+
+    /// As [`Engine::apply_config`], refused when another commit landed after
+    /// revision `base`, the revision `next` was derived from. Callers read
+    /// the revision *before* reading the configuration they edit.
+    pub fn apply_config_from(&self, base: u64, next: &Config) -> Result<(), String> {
+        let _commit = self.commit_lock.lock().unwrap();
+        let now = self.config_revision();
+        if base != now {
+            return Err(stale(base, now));
+        }
+        self.apply_config_locked(next)
+    }
+
+    fn apply_config_locked(&self, next: &Config) -> Result<(), String> {
         let text = next.to_text();
         let parsed = Config::parse(&text)?;
         self.ensure_live_compatible(&parsed)?;
@@ -993,7 +1280,7 @@ impl Engine {
         if old == text {
             return Ok(());
         }
-        self.save_text(&text)?;
+        self.kernel_then_save(&parsed, &text)?;
         self.backup(&old);
         *self.cfg.write().unwrap() = parsed;
         self.push_history(old);
@@ -1003,15 +1290,20 @@ impl Engine {
     }
 
     pub fn rollback_config(&self) -> Result<String, String> {
-        let old = {
-            let mut history = self.history.lock().unwrap();
-            history
-                .pop()
-                .ok_or_else(|| "no previous configuration is available".to_string())?
-        };
+        let _commit = self.commit_lock.lock().unwrap();
+        let old = self
+            .history
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .ok_or_else(|| "no previous configuration is available".to_string())?;
         let parsed = Config::parse(&old)?;
         self.ensure_live_compatible(&parsed)?;
-        self.save_text(&old)?;
+        // Only consume the history entry once the kernel (if any) and the
+        // disk both have the rolled-back configuration.
+        self.kernel_then_save(&parsed, &old)?;
+        self.history.lock().unwrap().pop();
         *self.cfg.write().unwrap() = parsed;
         *self.candidate.lock().unwrap() = None;
         *self.revisions.lock().unwrap() += 1;
@@ -1073,6 +1365,7 @@ impl Engine {
     }
 
     pub fn run(self: Arc<Self>) -> ! {
+        self.dataplane_running.store(true, Ordering::SeqCst);
         let mut buf = vec![0u8; 65536];
         let poll_timeout_ms = 250;
         let mut last_purge = Instant::now();
@@ -1411,7 +1704,8 @@ impl Engine {
                 let policy_now = cfg.policy_by_id(&s.key.vdom, s.policy_id);
                 // A flow whose policy was deleted, disabled or turned into a
                 // deny is cut off instead of living on until it times out.
-                let Some(policy) = policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                let Some(policy) = policy_now
+                    .filter(|p| p.enabled && p.action == Action::Permit && self.session_still_permitted(cfg, &s))
                 else {
                     self.sessions.lock().unwrap().touch(&s.key, 0);
                     self.log_event(
@@ -1528,7 +1822,8 @@ impl Engine {
                 // the original flow.
                 out_slot = self.slot_for_index(s.in_index).unwrap_or(slot);
                 let policy_now = cfg.policy_by_id(&s.key.vdom, s.policy_id);
-                let Some(policy) = policy_now.filter(|p| p.enabled && p.action == Action::Permit)
+                let Some(policy) = policy_now
+                    .filter(|p| p.enabled && p.action == Action::Permit && self.session_still_permitted(cfg, &s))
                 else {
                     self.sessions.lock().unwrap().touch(&s.key, 0);
                     self.log_event(
@@ -1907,6 +2202,7 @@ impl Engine {
                 app_buf: [Vec::new(), Vec::new()],
                 app_seq: [None, None],
                 user: user.clone(),
+                rev: self.config_revision(),
             });
             if let Some(s) = &session {
                 self.sessions.lock().unwrap().insert(s.clone());
@@ -2259,6 +2555,44 @@ fn json_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Kernel settings under `root` (normally `/proc/sys/net`) that would let
+/// the kernel route packets between the firewall's interfaces by itself.
+/// AF_PACKET sockets receive *copies* of frames: they do not stop the kernel
+/// from forwarding the originals, so with forwarding on, traffic would reach
+/// its destination unfiltered alongside the engine. A file that does not
+/// exist (IPv6 disabled, interface gone) is not a problem.
+pub fn kernel_forwarding_problems(root: &std::path::Path, interfaces: &[String]) -> Vec<String> {
+    let on = |rel: String| -> Option<String> {
+        let path = root.join(&rel);
+        let value = fs::read_to_string(&path).ok()?;
+        (value.trim() != "0").then(|| format!("kernel forwarding enabled: {} = {}", path.display(), value.trim()))
+    };
+    let mut out = Vec::new();
+    // The global switch sets every interface; per-interface values are only
+    // worth reporting when the global one is off.
+    for (global, family) in [("ipv4/ip_forward", "ipv4"), ("ipv6/conf/all/forwarding", "ipv6")] {
+        if let Some(problem) = on(global.to_string()) {
+            out.push(problem);
+            continue;
+        }
+        for name in interfaces {
+            if name.is_empty() || name.contains('/') || name.contains("..") {
+                continue;
+            }
+            out.extend(on(format!("{family}/conf/{name}/forwarding")));
+        }
+    }
+    out
+}
+
+/// Error for an edit based on an outdated configuration revision.
+fn stale(base: u64, now: u64) -> String {
+    format!(
+        "configuration changed since this edit started (based on revision {base}, running is revision {now}); \
+         review the running configuration and retry"
+    )
+}
+
 fn security_drop(
     cfg: &Config,
     policy: &crate::model::Policy,
@@ -2416,6 +2750,7 @@ mod tests {
             app_buf: [Vec::new(), Vec::new()],
             app_seq: [None, None],
             user: None,
+            rev: 1,
         }
     }
 
@@ -2604,11 +2939,19 @@ mod engine_tests {
                 logs: Mutex::new(VecDeque::new()),
                 hits: Mutex::new(HashMap::new()),
                 candidate: Mutex::new(None),
+                candidate_base: Mutex::new(0),
+                commit_lock: Mutex::new(()),
                 history: Mutex::new(Vec::new()),
                 revisions: Mutex::new(1),
                 users: Mutex::new(HashMap::new()),
                 ha_active: AtomicBool::new(true),
                 ha_suspended: AtomicBool::new(false),
+                dataplane_expected: false,
+                dataplane_running: AtomicBool::new(false),
+                attach_problems: Mutex::new(Vec::new()),
+                kernel_problems: Mutex::new(Vec::new()),
+                kernel: None,
+                kernel_state: Mutex::new(Some("kernel ruleset not installed yet".to_string())),
                 ha: Mutex::new(crate::ha::Status::default()),
                 vpn: Mutex::new(devices(&snapshot)),
                 inject: Mutex::new(Vec::new()),
@@ -2616,6 +2959,20 @@ mod engine_tests {
                 nd: Mutex::new(HashMap::new()),
                 sent: Mutex::new(Vec::new()),
             }
+        }
+
+        /// As `for_test`, with a private configuration file attached so
+        /// commits (which save before activating) succeed.
+        pub(crate) fn for_test_with_file(cfg: Config) -> Engine {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!("vela-test-{}-{n}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("firewall.conf");
+            fs::write(&path, cfg.to_text()).unwrap();
+            let mut e = Engine::for_test(cfg);
+            e.config_path = Some(path);
+            e
         }
 
         pub(crate) fn learn(&self, vdom: &str, ip: &str, mac: [u8; 6]) {
@@ -3214,5 +3571,404 @@ mod engine_tests {
         assert_eq!(flow(&e, 40030, 443, &client_hello("github.com")), 3);
         let s = e.sessions.lock().unwrap().snapshot().into_iter().find(|s| s.key.sport == 40030).unwrap();
         assert_eq!(s.nat_src.map(|n| n.0), Some("203.0.113.1".parse().unwrap()));
+    }
+
+    // ----------------------------------------------------------------
+    // Regression tests for the Stage 2/3 findings in AUDIT.md.
+
+    /// `engine()` with a configuration file, for tests that commit.
+    fn engine_f(policies: &str) -> Engine {
+        let e = Engine::for_test_with_file(base_config(policies));
+        e.learn("root", "203.0.113.10", SERVER_MAC);
+        e.learn("root", "10.0.0.10", CLIENT_MAC);
+        e
+    }
+
+    fn base_config(policies: &str) -> Config {
+        Config::parse(&format!(
+            "system logging on\n\
+             interface lan zone trust address 10.0.0.1/24\n\
+             interface wan zone untrust address 203.0.113.1/24\n\
+             {policies}"
+        ))
+        .unwrap()
+    }
+
+    /// One more client data segment on an established flow; true if it left on wan.
+    fn segment(e: &Engine, sport: u16, dport: u16) -> bool {
+        let lan = e.ifaces[0].mac;
+        let before = e.tx("wan");
+        e.handle(0, &mut tcp(lan, CLIENT_MAC, "10.0.0.10", sport, "203.0.113.10", dport, PSHACK, b"more"));
+        e.tx("wan") > before
+    }
+
+    #[test]
+    fn c10_unrelated_commit_keeps_open_flows() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        assert_eq!(flow(&e, 41000, 80, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"), 3);
+        e.apply_config(&base_config(
+            "policy 10 trust untrust any any tcp any permit\n\
+             policy 30 trust untrust any any udp 53 permit\n",
+        ))
+        .unwrap();
+        assert!(segment(&e, 41000, 80), "an unrelated commit must not cut the flow");
+        let s = e.sessions.lock().unwrap().snapshot().into_iter().find(|s| s.key.sport == 41000).unwrap();
+        assert_eq!(s.rev, e.config_revision(), "session re-checked and stamped with the new revision");
+    }
+
+    #[test]
+    fn c10_narrowing_a_permit_cuts_flows_already_open() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        assert_eq!(flow(&e, 41001, 80, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"), 3);
+        // Same policy id, still enabled and permit, but no longer covering port 80.
+        e.apply_config(&base_config("policy 10 trust untrust any any tcp 443 permit\n")).unwrap();
+        assert!(!segment(&e, 41001, 80), "flow outside the narrowed policy must be cut");
+        assert!(e.last_log().contains("policy-withdrawn"), "{}", e.last_log());
+        assert!(!segment(&e, 41001, 80), "and stays cut");
+    }
+
+    #[test]
+    fn c10_deny_inserted_above_cuts_flows_already_open() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        assert_eq!(flow(&e, 41002, 80, b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"), 3);
+        e.apply_config(&base_config(
+            "policy 5 trust untrust any 203.0.113.10/32 tcp 80 deny\n\
+             policy 10 trust untrust any any tcp any permit\n",
+        ))
+        .unwrap();
+        assert!(!segment(&e, 41002, 80), "a deny above the session's policy must cut it");
+    }
+
+    #[test]
+    fn c10_ipv6_flows_are_revalidated_after_commit() {
+        let e6 = engine6();
+        let e = Engine::for_test_with_file(e6.cfg.read().unwrap().clone());
+        *e.nd.lock().unwrap() = e6.nd.lock().unwrap().clone();
+        let (lan, wan) = (e.ifaces[0].mac, e.ifaces[1].mac);
+        let (c, srv) = ("2001:db8:1::10", "2001:db8:2::10");
+        e.handle(0, &mut tcp6(lan, CLIENT_MAC, c, 51000, srv, 443, SYN, 64, &[]));
+        e.handle(1, &mut tcp6(wan, SERVER_MAC, srv, 443, c, 51000, SYNACK, 64, &[]));
+        e.handle(0, &mut tcp6(lan, CLIENT_MAC, c, 51000, srv, 443, ACK, 64, &[]));
+        assert_eq!(sent6(&e).len(), 3);
+        let text = e.running_text().replace("2001:db8:2::/64 tcp 443 permit", "2001:db8:2::/64 tcp 8443 permit");
+        e.apply_config(&Config::parse(&text).unwrap()).unwrap();
+        e.handle(0, &mut tcp6(lan, CLIENT_MAC, c, 51000, srv, 443, ACK, 64, &[]));
+        assert_eq!(sent6(&e).len(), 3, "IPv6 flow outside the narrowed policy is cut");
+        assert!(e.last_log().contains("policy-withdrawn"), "{}", e.last_log());
+    }
+
+    #[test]
+    fn c6_ipv6_syn_flood_limit_applies_and_shares_the_ipv4_counter() {
+        let text = "system logging on\n\
+             interface lan zone trust address 10.0.0.1/24 address6 2001:db8:1::1/64\n\
+             interface wan zone untrust address 203.0.113.1/24 address6 2001:db8:2::1/64\n\
+             zone trust syn-flood 2\n\
+             policy 10 trust untrust any any tcp any permit\n";
+        let e = Engine::for_test(Config::parse(text).unwrap());
+        let now = Instant::now();
+        e.nd.lock().unwrap().insert(("root".into(), ip6("2001:db8:2::10")), (SERVER_MAC, now));
+        e.learn("root", "203.0.113.10", SERVER_MAC);
+        let lan = e.ifaces[0].mac;
+        // One IPv4 SYN and one IPv6 SYN fit the limit of 2 per second...
+        e.handle(0, &mut tcp(lan, CLIENT_MAC, "10.0.0.10", 42000, "203.0.113.10", 443, SYN, &[]));
+        e.handle(0, &mut tcp6(lan, CLIENT_MAC, "2001:db8:1::10", 42001, "2001:db8:2::10", 443, SYN, 64, &[]));
+        assert_eq!(sent6(&e).len(), 1);
+        // ...the third SYN of the second, over IPv6, does not.
+        e.handle(0, &mut tcp6(lan, CLIENT_MAC, "2001:db8:1::10", 42002, "2001:db8:2::10", 443, SYN, 64, &[]));
+        assert_eq!(sent6(&e).len(), 1, "IPv6 SYN over the zone limit is dropped");
+        assert!(e.last_log().contains("zone-protection syn-flood"), "{}", e.last_log());
+    }
+
+    #[test]
+    fn c9_stale_candidate_and_stale_edits_are_refused() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        let loaded = e.config_revision();
+        let mine = base_config("policy 10 trust untrust any any tcp 443 permit\n").to_text();
+        let theirs = base_config("policy 10 trust untrust any any tcp 22 permit\n");
+
+        // GUI stages an edit of the revision it loaded; another admin commits.
+        e.stage_config_from(Some(loaded), &mine).unwrap();
+        e.apply_config(&theirs).unwrap();
+        let err = e.commit_candidate().unwrap_err();
+        assert!(err.contains("changed since"), "{err}");
+        assert!(e.running_text().contains("tcp 22 permit"), "the other admin's commit survives");
+
+        // Staging an edit of an outdated revision is refused up front.
+        assert!(e.stage_config_from(Some(loaded), &mine).is_err());
+        // So is an engine-level edit derived from an old revision.
+        assert!(e.apply_config_from(loaded, &Config::parse(&mine).unwrap()).is_err());
+        // Edits based on the current revision go through.
+        let now = e.config_revision();
+        e.apply_config_from(now, &Config::parse(&mine).unwrap()).unwrap();
+        assert_eq!(e.config_revision(), now + 1);
+    }
+
+    #[test]
+    fn c7_native_cli_policy_changes_use_the_commit_path() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        let rev = e.config_revision();
+        let out = crate::cli::execute(&e, "policy add 20 trust untrust any any udp 53 permit");
+        assert!(out.starts_with("policy added"), "{out}");
+        assert_eq!(e.config_revision(), rev + 1, "CLI changes bump the revision");
+        let saved = fs::read_to_string(e.config_path.as_ref().unwrap()).unwrap();
+        assert!(saved.contains("policy 20"), "saved before activation: {saved}");
+
+        let out = crate::cli::execute(&e, "policy delete 10");
+        assert_eq!(out, "policy 10 deleted");
+        assert!(crate::cli::execute(&e, "policy delete 10").contains("not found"));
+        // CLI changes are in the history, so rollback restores them in order.
+        e.rollback_config().unwrap();
+        assert!(e.running_text().contains("policy 10 "), "delete rolled back");
+        e.rollback_config().unwrap();
+        assert!(!e.running_text().contains("policy 20"), "add rolled back");
+        // An invalid addition changes nothing.
+        let out = crate::cli::execute(&e, "policy add 10 trust untrust any any tcp any permit");
+        assert!(out.starts_with("error:"), "{out}");
+        assert_eq!(e.cfg.read().unwrap().policies.len(), 1);
+    }
+
+    #[test]
+    fn c2_c3_enforcement_problems_report_degraded_state() {
+        let mut e = engine("policy 10 trust untrust any any tcp any permit\n");
+        assert!(e.enforcement_problems().is_empty(), "control-plane-only engines report nothing");
+        e.dataplane_expected = true;
+        e.attach_problems.lock().unwrap().push("interface wan: not found (zone untrust)".into());
+        let p = e.enforcement_problems();
+        assert!(p.iter().any(|x| x.contains("packet loop is not running")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("interface wan")), "{p:?}");
+        e.dataplane_running.store(true, Ordering::SeqCst);
+        e.attach_problems.lock().unwrap().clear();
+        assert!(e.enforcement_problems().is_empty());
+        e.kernel_problems.lock().unwrap().push("kernel forwarding enabled".into());
+        assert_eq!(e.enforcement_problems().len(), 1);
+    }
+
+    #[test]
+    fn c1_kernel_forwarding_problems_are_detected() {
+        let root = std::env::temp_dir().join(format!("vela-sysctl-{}", std::process::id()));
+        let write = |rel: &str, v: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, v).unwrap();
+        };
+        let names = vec!["lan".to_string(), "wan".to_string()];
+        write("ipv4/ip_forward", "0\n");
+        write("ipv6/conf/all/forwarding", "0\n");
+        write("ipv4/conf/lan/forwarding", "0\n");
+        write("ipv4/conf/wan/forwarding", "0\n");
+        assert!(kernel_forwarding_problems(&root, &names).is_empty(), "all off");
+        // Missing files (IPv6 per-interface, unknown interface) are fine.
+        assert!(kernel_forwarding_problems(&root, &["ghost".to_string()]).is_empty());
+
+        write("ipv4/conf/wan/forwarding", "1\n");
+        let p = kernel_forwarding_problems(&root, &names);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("ipv4/conf/wan/forwarding"), "{p:?}");
+
+        write("ipv4/ip_forward", "1\n");
+        write("ipv6/conf/all/forwarding", "1\n");
+        let p = kernel_forwarding_problems(&root, &names);
+        assert_eq!(p.len(), 2, "global switches reported once per family: {p:?}");
+        // Path tricks in interface names are ignored.
+        write("ipv4/ip_forward", "0\n");
+        write("ipv6/conf/all/forwarding", "0\n");
+        write("ipv4/conf/wan/forwarding", "0\n");
+        assert!(kernel_forwarding_problems(&root, &["../../ipv4".to_string()]).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---------------------------------------------- Stage 2: daemon-managed
+    // kernel mode, driven through a fake backend (no kernel needed).
+
+    #[derive(Default)]
+    struct FakeKernel {
+        /// Hostnames of every configuration applied, in order.
+        applied: Mutex<Vec<String>>,
+        /// Apply fails for configurations with this hostname.
+        fail_for: Mutex<Option<String>>,
+        /// Every apply fails.
+        fail_all: AtomicBool,
+        /// What `check` reports (None = in place).
+        drift: Mutex<Option<String>>,
+        lockdowns: Mutex<u32>,
+    }
+
+    struct FakeRef(Arc<FakeKernel>);
+
+    impl crate::nft::Backend for FakeRef {
+        fn apply(&self, cfg: &Config) -> Result<(), String> {
+            let name = cfg.settings.hostname.clone();
+            if self.0.fail_all.load(Ordering::SeqCst) || self.0.fail_for.lock().unwrap().as_deref() == Some(name.as_str()) {
+                return Err(format!("simulated failure for {name}"));
+            }
+            self.0.applied.lock().unwrap().push(name);
+            *self.0.drift.lock().unwrap() = None;
+            Ok(())
+        }
+        fn check(&self) -> Result<(), String> {
+            self.0.drift.lock().unwrap().clone().map_or(Ok(()), Err)
+        }
+        fn lockdown(&self) -> Result<(), String> {
+            *self.0.lockdowns.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn kernel_engine() -> (Engine, Arc<FakeKernel>) {
+        let mut e = Engine::for_test_with_file(base_config("system hostname v1\npolicy 10 trust untrust any any tcp any permit\n"));
+        let fake = Arc::new(FakeKernel::default());
+        e.kernel = Some(Box::new(FakeRef(fake.clone())));
+        e.kernel_start().unwrap();
+        (e, fake)
+    }
+
+    fn named(host: &str) -> Config {
+        base_config(&format!("system hostname {host}\npolicy 10 trust untrust any any tcp any permit\n"))
+    }
+
+    #[test]
+    fn kernel_mode_starts_verified_and_commits_reach_the_kernel_first() {
+        let (e, fake) = kernel_engine();
+        assert_eq!(*fake.applied.lock().unwrap(), vec!["v1"]);
+        assert_eq!(e.dataplane_status(), "kernel");
+        assert!(e.enforcement_problems().is_empty());
+        e.apply_config(&named("v2")).unwrap();
+        assert_eq!(*fake.applied.lock().unwrap(), vec!["v1", "v2"]);
+        assert_eq!(e.cfg.read().unwrap().settings.hostname, "v2");
+    }
+
+    #[test]
+    fn kernel_failure_restores_the_previous_ruleset_and_keeps_the_running_config() {
+        let (e, fake) = kernel_engine();
+        let rev = e.config_revision();
+        *fake.fail_for.lock().unwrap() = Some("bad".into());
+        let err = e.apply_config(&named("bad")).unwrap_err();
+        assert!(err.contains("previous ruleset was restored"), "{err}");
+        assert_eq!(*fake.applied.lock().unwrap(), vec!["v1", "v1"], "previous configuration reinstalled");
+        assert_eq!(e.cfg.read().unwrap().settings.hostname, "v1", "running config unchanged");
+        assert_eq!(e.config_revision(), rev, "no new revision");
+        let saved = fs::read_to_string(e.config_path.as_ref().unwrap()).unwrap();
+        assert!(saved.contains("hostname v1") && !saved.contains("hostname bad"), "disk unchanged");
+        assert_eq!(e.dataplane_status(), "kernel", "still verified on the old ruleset");
+    }
+
+    #[test]
+    fn when_restore_also_fails_forwarding_is_locked_down_and_reported() {
+        let (e, fake) = kernel_engine();
+        fake.fail_all.store(true, Ordering::SeqCst);
+        let err = e.apply_config(&named("v2")).unwrap_err();
+        assert!(err.contains("locked down"), "{err}");
+        assert_eq!(*fake.lockdowns.lock().unwrap(), 1);
+        assert_eq!(e.dataplane_status(), "degraded");
+        assert!(e.enforcement_problems()[0].contains("locked down"));
+    }
+
+    #[test]
+    fn kernel_startup_failure_locks_down() {
+        let mut e = Engine::for_test_with_file(named("v1"));
+        let fake = Arc::new(FakeKernel::default());
+        fake.fail_all.store(true, Ordering::SeqCst);
+        e.kernel = Some(Box::new(FakeRef(fake.clone())));
+        assert!(e.kernel_start().unwrap_err().contains("locked down"));
+        assert_eq!(*fake.lockdowns.lock().unwrap(), 1);
+        assert_eq!(e.dataplane_status(), "degraded");
+    }
+
+    #[test]
+    fn drift_is_detected_and_the_running_ruleset_reinstalled() {
+        let (e, fake) = kernel_engine();
+        assert_eq!(e.kernel_reconcile(), None, "nothing to do while in place");
+        *fake.drift.lock().unwrap() = Some("chain forward: 1 rule(s) not installed by the firewall".into());
+        let event = e.kernel_reconcile().unwrap();
+        assert!(event.contains("drift detected") && event.contains("reinstalled"), "{event}");
+        assert_eq!(fake.applied.lock().unwrap().last().unwrap(), "v1");
+        assert_eq!(e.dataplane_status(), "kernel");
+        // Drift that cannot be repaired ends in lockdown.
+        *fake.drift.lock().unwrap() = Some("table missing".into());
+        fake.fail_all.store(true, Ordering::SeqCst);
+        assert!(e.kernel_reconcile().unwrap().contains("locked down"));
+        assert_eq!(e.dataplane_status(), "degraded");
+    }
+
+    #[test]
+    fn inexact_configurations_are_refused_before_the_kernel_is_touched() {
+        let (e, fake) = kernel_engine();
+        let next = base_config("system hostname v2\nurl-filter corp block example.com\npolicy 10 trust untrust any any tcp any permit url corp\n");
+        let err = e.apply_config(&next).unwrap_err();
+        assert!(err.contains("cannot enforce this configuration exactly"), "{err}");
+        assert_eq!(*fake.applied.lock().unwrap(), vec!["v1"], "kernel untouched");
+        assert_eq!(e.cfg.read().unwrap().settings.hostname, "v1");
+    }
+
+    #[test]
+    fn kernel_mode_rollback_keeps_history_when_the_kernel_refuses() {
+        let (e, fake) = kernel_engine();
+        e.apply_config(&named("v2")).unwrap();
+        *fake.fail_for.lock().unwrap() = Some("v1".into());
+        assert!(e.rollback_config().is_err());
+        *fake.fail_for.lock().unwrap() = None;
+        e.rollback_config().unwrap();
+        assert_eq!(e.cfg.read().unwrap().settings.hostname, "v1", "history entry survived the failed attempt");
+    }
+
+    #[test]
+    fn switching_dataplane_mode_needs_a_restart() {
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        let err = e
+            .apply_config(&base_config("system dataplane kernel\npolicy 10 trust untrust any any tcp any permit\n"))
+            .unwrap_err();
+        assert!(err.contains("requires a daemon restart"), "{err}");
+    }
+
+    // ---------------------------------------------- GUI structured edits
+
+    fn ed(mode: crate::editor::Mode, key: &str, lines: &[&str]) -> crate::editor::Edit {
+        crate::editor::Edit { mode, vdom: "root".into(), key: key.into(), lines: lines.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn gui_edits_build_a_candidate_and_commit_through_the_pipeline() {
+        use crate::editor::Mode;
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        let rev = e.config_revision();
+        assert_eq!(e.candidate_base(), rev);
+        e.edit_candidate(Some(rev), &[ed(Mode::Create, "", &["policy 20 trust untrust any any udp 53 permit"])]).unwrap();
+        assert!(e.pending_changes() >= 1);
+        assert_eq!(e.config_revision(), rev, "nothing is live before commit");
+        // Further edits stack onto the same candidate.
+        e.edit_candidate(Some(rev), &[ed(Mode::Create, "", &["address web 10.1.0.10"])]).unwrap();
+        e.commit_candidate().unwrap();
+        let running = e.running_text();
+        assert!(running.contains("policy 20") && running.contains("address web"), "{running}");
+        assert_eq!(e.pending_changes(), 0);
+    }
+
+    #[test]
+    fn gui_edits_from_a_stale_view_or_invalid_results_are_refused() {
+        use crate::editor::Mode;
+        let e = engine_f("policy 10 trust untrust any any tcp any permit\n");
+        let seen = e.config_revision();
+        e.apply_config(&base_config("policy 10 trust untrust any any tcp 443 permit\n")).unwrap();
+        let err = e.edit_candidate(Some(seen), &[ed(Mode::Delete, "policy 10", &[])]).unwrap_err();
+        assert!(err.contains("changed since"), "{err}");
+        // A result the parser rejects never becomes the candidate.
+        let err = e.edit_candidate(None, &[ed(Mode::Create, "", &["policy 20 trust untrust @nope any any any permit"])]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(e.candidate_text().is_none());
+        // Interface additions still need a restart.
+        let err = e.edit_candidate(None, &[ed(Mode::Create, "", &["interface eth9 zone dmz address 10.9.0.1/24"])]).unwrap_err();
+        assert!(err.contains("restart"), "{err}");
+    }
+
+    #[test]
+    fn gui_edits_in_kernel_mode_are_checked_for_exact_enforcement_before_staging() {
+        use crate::editor::Mode;
+        let (e, fake) = kernel_engine();
+        let err = e
+            .edit_candidate(None, &[ed(Mode::Create, "", &["policy 20 trust untrust any any tcp any permit user alice"])])
+            .unwrap_err();
+        assert!(err.contains("cannot enforce"), "{err}");
+        assert!(e.candidate_text().is_none());
+        assert_eq!(*fake.applied.lock().unwrap(), vec!["v1"], "kernel untouched while editing");
     }
 }

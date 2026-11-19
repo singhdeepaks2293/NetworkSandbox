@@ -1,0 +1,347 @@
+{
+ "sections": [
+  {
+   "objects": [
+    {
+     "key": "system hostname",
+     "kind": "system",
+     "lines": [
+      "system hostname firewall"
+     ]
+    },
+    {
+     "key": "system cli-port",
+     "kind": "system",
+     "lines": [
+      "system cli-port 2200"
+     ]
+    },
+    {
+     "key": "system gui-port",
+     "kind": "system",
+     "lines": [
+      "system gui-port 8080"
+     ]
+    },
+    {
+     "key": "system cli-bind",
+     "kind": "system",
+     "lines": [
+      "system cli-bind 127.0.0.1"
+     ]
+    },
+    {
+     "key": "system gui-bind",
+     "kind": "system",
+     "lines": [
+      "system gui-bind 127.0.0.1"
+     ]
+    },
+    {
+     "key": "system tls",
+     "kind": "system",
+     "lines": [
+      "system tls on"
+     ]
+    },
+    {
+     "key": "system api-rate",
+     "kind": "system",
+     "lines": [
+      "system api-rate 600"
+     ]
+    },
+    {
+     "key": "system api-burst",
+     "kind": "system",
+     "lines": [
+      "system api-burst 120"
+     ]
+    },
+    {
+     "key": "system max-body",
+     "kind": "system",
+     "lines": [
+      "system max-body 1048576"
+     ]
+    },
+    {
+     "key": "system max-sessions",
+     "kind": "system",
+     "lines": [
+      "system max-sessions 100000"
+     ]
+    },
+    {
+     "key": "system max-sessions-per-ip",
+     "kind": "system",
+     "lines": [
+      "system max-sessions-per-ip 0"
+     ]
+    },
+    {
+     "key": "system max-packet",
+     "kind": "system",
+     "lines": [
+      "system max-packet 65535"
+     ]
+    },
+    {
+     "key": "system max-inspection",
+     "kind": "system",
+     "lines": [
+      "system max-inspection 65535"
+     ]
+    },
+    {
+     "key": "system source-rate",
+     "kind": "system",
+     "lines": [
+      "system source-rate 0"
+     ]
+    },
+    {
+     "key": "system source-burst",
+     "kind": "system",
+     "lines": [
+      "system source-burst 0"
+     ]
+    },
+    {
+     "key": "system conntrack-tcp",
+     "kind": "system",
+     "lines": [
+      "system conntrack-tcp 300"
+     ]
+    },
+    {
+     "key": "system conntrack-udp",
+     "kind": "system",
+     "lines": [
+      "system conntrack-udp 30"
+     ]
+    },
+    {
+     "key": "system conntrack-icmp",
+     "kind": "system",
+     "lines": [
+      "system conntrack-icmp 10"
+     ]
+    },
+    {
+     "key": "system logging",
+     "kind": "system",
+     "lines": [
+      "system logging on"
+     ]
+    },
+    {
+     "key": "system log-format",
+     "kind": "system",
+     "lines": [
+      "system log-format text"
+     ]
+    },
+    {
+     "key": "address quarantine",
+     "kind": "address",
+     "lines": [
+      "address quarantine 10.0.0.66/32"
+     ]
+    },
+    {
+     "key": "address web",
+     "kind": "address",
+     "lines": [
+      "address web 10.1.0.10/32 2001:db8:10::10/128"
+     ]
+    },
+    {
+     "key": "address-group servers",
+     "kind": "address-group",
+     "lines": [
+      "address-group servers web quarantine"
+     ]
+    },
+    {
+     "key": "service web",
+     "kind": "service",
+     "lines": [
+      "service web tcp 80,443,8000-8080"
+     ]
+    },
+    {
+     "key": "service-group basics",
+     "kind": "service-group",
+     "lines": [
+      "service-group basics web"
+     ]
+    },
+    {
+     "key": "app-def admin-ui",
+     "kind": "app-def",
+     "lines": [
+      "app-def admin-ui tcp 8443"
+     ]
+    },
+    {
+     "key": "app-group social",
+     "kind": "app-group",
+     "lines": [
+      "app-group social facebook instagram category:social-networking"
+     ]
+    },
+    {
+     "key": "user-group admins",
+     "kind": "user-group",
+     "lines": [
+      "user-group admins alice bob"
+     ]
+    },
+    {
+     "key": "user-map 10.0.5.0/24",
+     "kind": "user-map",
+     "lines": [
+      "user-map 10.0.5.0/24 kiosk"
+     ]
+    },
+    {
+     "key": "url-filter corp",
+     "kind": "url-filter",
+     "lines": [
+      "url-filter corp block bad.example worse.example",
+      "url-filter corp allow good.example"
+     ]
+    },
+    {
+     "key": "ips-profile edge",
+     "kind": "ips-profile",
+     "lines": [
+      "ips-profile edge",
+      "ips-signature edge 1 /etc/passwd"
+     ]
+    },
+    {
+     "key": "av-profile av",
+     "kind": "av-profile",
+     "lines": [
+      "av-profile av",
+      "av-signature av 1 EICAR"
+     ]
+    },
+    {
+     "key": "shaper slow",
+     "kind": "shaper",
+     "lines": [
+      "shaper slow 512"
+     ]
+    },
+    {
+     "key": "profile-group default",
+     "kind": "profile-group",
+     "lines": [
+      "profile-group default url corp ips edge av av"
+     ]
+    }
+   ],
+   "vdom": null
+  },
+  {
+   "objects": [
+    {
+     "key": "interface port1",
+     "kind": "interface",
+     "lines": [
+      "interface port1 zone untrust address 203.0.113.2/24"
+     ]
+    },
+    {
+     "key": "interface port2",
+     "kind": "interface",
+     "lines": [
+      "interface port2 zone trust address 10.0.0.1/24 address6 2001:db8:1::1/64"
+     ]
+    },
+    {
+     "key": "route default port1 via 203.0.113.1",
+     "kind": "route",
+     "lines": [
+      "route default port1 via 203.0.113.1"
+     ]
+    },
+    {
+     "key": "route 172.16.0.0/12 port2 via 10.0.0.254 distance 20 name lab",
+     "kind": "route",
+     "lines": [
+      "route 172.16.0.0/12 port2 via 10.0.0.254 distance 20 name lab"
+     ]
+    },
+    {
+     "key": "route6 default port1 via 2001:db8:ffff::1",
+     "kind": "route6",
+     "lines": [
+      "route6 default port1 via 2001:db8:ffff::1"
+     ]
+    },
+    {
+     "key": "policy 10",
+     "kind": "policy",
+     "lines": [
+      "policy 10 trust untrust any any tcp application-default deny app social"
+     ]
+    },
+    {
+     "key": "policy 20",
+     "kind": "policy",
+     "lines": [
+      "policy 20 trust untrust !@quarantine any any @basics permit nat name out group default"
+     ]
+    },
+    {
+     "key": "policy 30",
+     "kind": "policy",
+     "lines": [
+      "policy 30 trust untrust any any udp 53 permit nolog disable user admins shaper slow"
+     ]
+    },
+    {
+     "key": "snat 10",
+     "kind": "snat",
+     "lines": [
+      "snat 10 trust untrust 10.0.0.0/24 any masquerade name lan-out"
+     ]
+    },
+    {
+     "key": "dnat 1",
+     "kind": "dnat",
+     "lines": [
+      "dnat 1 tcp 203.0.113.2/32 443 10.1.0.10 443 name web-vip"
+     ]
+    },
+    {
+     "key": "default-rule intrazone",
+     "kind": "default-rule",
+     "lines": [
+      "default-rule intrazone allow log"
+     ]
+    },
+    {
+     "key": "default-rule interzone",
+     "kind": "default-rule",
+     "lines": [
+      "default-rule interzone deny"
+     ]
+    },
+    {
+     "key": "zone untrust",
+     "kind": "zone",
+     "lines": [
+      "zone untrust syn-flood 100",
+      "zone untrust udp-flood 500"
+     ]
+    }
+   ],
+   "vdom": "root"
+  }
+ ]
+}

@@ -41,3 +41,27 @@ handling and tests in this repository were written from scratch.
 - Partitioning is a small original VDOM-like model: one flat configuration file
   with `vdom` sections, shared named objects, and no administrative VDOM
   contexts, inter-VDOM links or per-VDOM management roles.
+
+## Recorded test runs
+
+| Date | Commit / branch | Command | Result |
+| --- | --- | --- | --- |
+| 2026-11-19 | `8312f73` (baseline) | `cargo test --release` (rustc 1.91.1) | 134 passed, 0 failed |
+| 2026-11-19 | `stage2-enforcement-safety` | `cargo test --release` (rustc 1.91.1) | 147 passed, 0 failed (13 new regression tests) |
+| 2026-11-19 | `stage2-enforcement-safety`, fixes disabled on purpose | `cargo test --release` | 7 of the new tests failed as expected (C10 ×4, C2/C3, C6, C5), confirming they guard the fixes; fixes then restored |
+
+| 2026-11-19 | `stage2-kernel-dataplane` | `cargo test --release` | 165 passed, 0 failed (18 new: exactness, tagging, netlink parse, verify, fake-backend kernel mode) |
+| 2026-11-19 | `stage2-kernel-dataplane`, guards disabled on purpose | `cargo test --release` | verify off, classifier off, restore off: 8 tests failed; drift repair off: 1 test failed; all restored to 165/165 |
+
+| 2026-11-20 | `stage6-gui` | `cargo test --release` | 175 passed, 0 failed (10 new: editor module, GUI edit path, kernel-mode edit refusal) |
+| 2026-11-20 | `stage6-gui` | `node tests/ui-model.test.js` | 47 objects across 22 kinds round-tripped byte-identically |
+| 2026-11-20 | `stage6-gui` | `node tests/ui-e2e.js` (jsdom 24, daemon `--dry-run` on `tests/fixtures/ui-sample.conf`) | 11 PASS: login, 27 pages render, create/edit/reorder via forms, inline and server validation errors, diff + commit, policy match, HTML injection rendered as text, discard, read-only role (no controls, 403), CSRF enforced |
+
+Not yet run on this branch: `tests/network-namespace.sh`, `tests/nft-kernel.sh`,
+`tests/containerlab-policy.sh`, `tests/containerlab-chain.sh`, and the new
+`tests/kernel-mode.sh` (written in Stage 2, never executed). The GUI has not
+been checked in a real browser (only jsdom): visual layout, dark mode and
+`<dialog>` behaviour need a manual look. They need root,
+network namespaces and containerlab, which the environment used for these runs
+did not have. Run them on a privileged Linux host and add the results here
+before merging.
