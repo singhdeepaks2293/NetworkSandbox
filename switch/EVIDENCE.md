@@ -1,13 +1,15 @@
-# Protocol evidence: IEEE 802.1Q-2005 MSTP and the switch protocol stack
+# Protocol evidence: switching protocols and OpenFlow 1.3
 
-This document records a single, reproducible containerlab run that exercises
-every protocol described in [`README.md`](README.md). It is evidence, not a
-tutorial: each section pairs the configuration that was entered with the CLI
+This document records two reproducible containerlab runs covering the protocol
+surface described in [`README.md`](README.md). Sections 3–9 are the MSTP/802.1Q
+run; section 12 is the optional OpenFlow 1.3 controller run. It is evidence, not
+a tutorial: each section pairs the configuration that was entered with the CLI
 output and, where the protocol is visible on the wire, the captured frame.
 
-The run was produced by [`tests/containerlab-evidence.sh`](tests/containerlab-evidence.sh)
-on **2026-10-25**. The complete transcript and all packet captures are kept
-under `/tmp/opencode/evidence-20261025-142009/`:
+The first run was produced by
+[`tests/containerlab-evidence.sh`](tests/containerlab-evidence.sh) on
+**2026-10-25**. Its complete transcript and packet captures are kept under
+`/tmp/opencode/evidence-20261025-142009/`:
 
 | Artifact | Contents |
 |----------|----------|
@@ -22,6 +24,11 @@ under `/tmp/opencode/evidence-20261025-142009/`:
 | `lldp-frame.pcap` | IEEE 802.1AB LLDPDU |
 | `pvst-plus.pcap` | 8-second filter for PVST+ BPDUs (zero frames) |
 | `startup-body.txt`, `restored-config-body.txt` | persisted vs. reloaded configuration |
+
+The second run was produced by
+[`tests/containerlab-openflow.sh`](tests/containerlab-openflow.sh) on
+**2026-11-19**. Its transcript, topology and startup config are kept under
+`/tmp/opencode/evidence-openflow-20261119-132743/`.
 
 ## 1. Result summary
 
@@ -43,6 +50,7 @@ under `/tmp/opencode/evidence-20261025-142009/`:
 | 14 | PVST+, RSTP, DTP, VTP, CDP, LACP rejected | — | PASS (exact errors) | [§8](#8-rejected-protocols) |
 | 15 | Startup-config persistence across a daemon reload | — | PASS (hash match) | [§9](#9-persistence-across-a-daemon-reload) |
 | 16 | STP fail-open when the feature is disabled | — | PASS | [§3.6](#36-fail-open-with-stp-disabled) |
+| 17 | OpenFlow 1.3 session, `PACKET_IN` learning, flow installation and forwarding with Ryu | OpenFlow 1.3.5 | PASS | [§12](#12-openflow-13-controller-interoperability-second-run) |
 
 The two properties the task centred on are visible in the first two rows of the
 transcript:
@@ -1093,9 +1101,192 @@ The unit-test suite complements this evidence:
 
 ```text
 cargo test
-test result: ok. 70 passed; 0 failed
+test result: ok. 76 passed; 0 failed
 ```
 
 Those tests cover the packet codec, the MST configuration digest vectors, the
-per-instance election, the feature gate and the state-machine regression that
-this evidence run exercised in the lab.
+per-instance election, the feature gate, the OpenFlow flow-mod decoder and the
+state-machine regression that these evidence runs exercised in the lab.
+
+## 12. OpenFlow 1.3 controller interoperability (second run)
+
+This run replaces the scripted socket peer with an actual external controller,
+Ryu's `simple_switch_13`. It verifies the optional feature gate, the
+HELLO/FEATURES handshake, the controller-installed table-miss flow,
+`PACKET_IN`/`PACKET_OUT`, `FLOW_MOD` parsing, multipart counters and
+bidirectional data forwarding.
+
+### 12.1 Environment and topology
+
+Values copied from the transcript header:
+
+```text
+date:         2026-11-19T07:57:44Z
+host:         Linux 6.16.10-200.fc42.x86_64 x86_64
+containerlab: 0.83.0
+runtime:      podman
+images:       fedora:42, osrg/ryu:latest, alpine:latest
+```
+
+`containerlab` is setuid-root on this host and drives rootful Podman storage,
+so the run needs no interactive `sudo`. The switch is the host-built
+`target/debug/switch` binary bind-mounted into a `fedora:42` container; Ryu
+runs from the stock `osrg/ryu` image.
+
+```text
+            172.20.20.0/24 management
+   ryu 172.20.20.100:6653
+            |
+   sw 172.20.20.10  eth1, eth2
+      |                    |
+   h1 10.10.0.1/24     h2 10.10.0.2/24
+```
+
+The switch starts with STP disabled so every frame reaches the OpenFlow hook,
+and with the feature explicitly enabled:
+
+```text
+feature disable stp
+feature enable openflow
+openflow controller 172.20.20.100 6653
+openflow fail-mode secure
+```
+
+### 12.2 Session and table-miss flow
+
+After the TCP session is established and Ryu's `switch_features_handler` has
+run, the switch reports exactly one flow: the priority-0 table-miss entry that
+sends unmatched packets to the controller.
+
+```text
+$ sw# show openflow
+OpenFlow 1.3 status
+  Feature:      enabled
+  Datapath ID:  0000024107b57941
+  Controller:   172.20.20.100:6653 (active)
+  Fail mode:    secure
+  Session:      connected to 172.20.20.100:6653
+  Flow entries: 1
+  Messages:     4 in, 3 out; errors 0
+  Packet-in:    0   Packet-out: 0   Flow-mods: 1
+  Lookups:      0 matched, 0 total
+```
+
+No traffic has been sent yet, so the absence of packet-ins is expected. The
+important handshake facts are the connected session, the active controller, the
+table-miss flow and zero OpenFlow errors.
+
+### 12.3 Learning, flow installation and forwarding
+
+`h1` pings `h2` across the switch. Ryu receives the ARP exchange and the first
+ICMP packet as `PACKET_IN`, floods them with `PACKET_OUT`, learns both source
+MACs, and installs a flow for each direction.
+
+```text
+$ h1# ping -c 3 -W 2 10.10.0.2
+PING 10.10.0.2 (10.10.0.2): 56 data bytes
+64 bytes from 10.10.0.2: seq=0 ttl=64 time=65.056 ms
+64 bytes from 10.10.0.2: seq=1 ttl=64 time=1.226 ms
+64 bytes from 10.10.0.2: seq=2 ttl=64 time=0.874 ms
+
+--- 10.10.0.2 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 0.874/22.385/65.056 ms
+```
+
+The flow count rises from the one table-miss entry to three (table-miss plus
+two host flows), still with zero errors:
+
+```text
+$ sw# show openflow
+OpenFlow 1.3 status
+  Feature:      enabled
+  Datapath ID:  0000024107b57941
+  Controller:   172.20.20.100:6653 (active)
+  Fail mode:    secure
+  Session:      connected to 172.20.20.100:6653
+  Flow entries: 3
+  Messages:     7 in, 6 out; errors 0
+  Packet-in:    3   Packet-out: 1   Flow-mods: 3
+  Lookups:      8 matched, 8 total
+```
+
+A reverse ping from `h2` exercises the second host flow independently:
+
+```text
+$ h2# ping -c 2 -W 2 10.10.0.1
+PING 10.10.0.1 (10.10.0.1): 56 data bytes
+64 bytes from 10.10.0.1: seq=0 ttl=64 time=0.661 ms
+64 bytes from 10.10.0.1: seq=1 ttl=64 time=0.585 ms
+
+--- 10.10.0.1 ping statistics ---
+2 packets transmitted, 2 packets received, 0% packet loss
+round-trip min/avg/max = 0.585/0.623/0.661 ms
+```
+
+The final counters record the additional matched lookups and no errors:
+
+```text
+$ sw# show openflow
+OpenFlow 1.3 status
+  Feature:      enabled
+  Datapath ID:  0000024107b57941
+  Controller:   172.20.20.100:6653 (active)
+  Fail mode:    secure
+  Session:      connected to 172.20.20.100:6653
+  Flow entries: 3
+  Messages:     9 in, 8 out; errors 0
+  Packet-in:    5   Packet-out: 3   Flow-mods: 3
+  Lookups:      14 matched, 14 total
+```
+
+### 12.4 Controller-side log
+
+Ryu loaded `simple_switch_13`, received the expected broadcast ARP and unicast
+ICMP packets, and logged no parse failure or traceback:
+
+```text
+loading app ryu.app.simple_switch_13
+loading app ryu.controller.ofp_handler
+instantiating app ryu.app.simple_switch_13 of SimpleSwitch13
+instantiating app ryu.controller.ofp_handler of OFPHandler
+packet in 2478325463361 aa:c1:ab:a8:8e:ed ff:ff:ff:ff:ff:ff 1
+packet in 2478325463361 aa:c1:ab:8b:4c:b4 aa:c1:ab:a8:8e:ed 2
+packet in 2478325463361 aa:c1:ab:a8:8e:ed aa:c1:ab:8b:4c:b4 1
+packet in 2478325463361 aa:c1:ab:8b:4c:b4 33:33:00:00:00:02 2
+packet in 2478325463361 aa:c1:ab:a8:8e:ed 33:33:00:00:00:02 1
+```
+
+### 12.5 Interoperability fixes found by this run
+
+The first attempt failed with `errors 4`, `Flow entries: 0` and no forwarding.
+Two protocol bugs were found and fixed before the transcript above was
+recorded:
+
+1. The switch sent an unsolicited `FEATURES_REQUEST` after the peer HELLO.
+   Ryu has no parser registered for a controller-bound request and logged a
+   `TypeError` for every session. HELLO now only marks the peer ready; the
+   controller sends `FEATURES_REQUEST` itself.
+2. `OFPIT_APPLY_ACTIONS` was parsed from the instruction type/length header,
+   treating the four `ofp_instruction_actions` pad bytes as an action header.
+   This produced `OFPBAC_BAD_LEN` for every Ryu flow-mod. The parser now skips
+   the pad, and the flow-mod unit test encodes the standard eight-byte
+   instruction header.
+
+The final run has `errors 0`, installs the table-miss and both host flows, and
+forwards in both directions. The unit-test suite still reports `76 passed`.
+
+### 12.6 Reproducing the OpenFlow run
+
+```bash
+cd switch
+./tests/containerlab-openflow.sh
+KEEP=1 ./tests/containerlab-openflow.sh    # leave the lab deployed
+RUNTIME=podman ./tests/containerlab-openflow.sh
+```
+
+The script builds the switch, generates the topology and startup config under
+the evidence directory, deploys the lab, waits for the Ryu session, asserts
+zero packet loss in both directions, asserts at least three flows and zero
+OpenFlow errors, then destroys the lab unless `KEEP=1`. Transcript and lab
+inputs are written to `/tmp/opencode/evidence-openflow-<timestamp>/`.

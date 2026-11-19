@@ -537,6 +537,25 @@ pub fn handle_frame(sw: &mut Switch, io: &Io, port: usize, data: &[u8]) {
         }
     }
 
+    // ---- OpenFlow pipeline ------------------------------------------------
+    // A flow entry can forward, drop or punt the frame.  A table miss falls
+    // through to the native bridge in standalone mode, or is sent to the
+    // controller when one is attached.
+    if sw.features.openflow && sw.openflow.enabled() {
+        if let crate::openflow::Verdict::Consumed = crate::openflow::process_ingress(
+            sw,
+            io,
+            port,
+            ingress_vlan,
+            pcp,
+            dei,
+            &frame,
+            data,
+        ) {
+            return;
+        }
+    }
+
     // ---- learning -----------------------------------------------------------
     if sw.features.mac_learning {
         learn(sw, ingress_vlan, frame.src, port, now);

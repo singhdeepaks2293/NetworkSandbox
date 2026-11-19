@@ -633,6 +633,7 @@ pub struct Features {
     pub bpdu_guard: bool,
     pub lldp: bool,
     pub telnet: bool,
+    pub openflow: bool,
 }
 
 impl Default for Features {
@@ -647,6 +648,7 @@ impl Default for Features {
             bpdu_guard: false,
             lldp: false,
             telnet: false,
+            openflow: false,
         }
     }
 }
@@ -663,6 +665,7 @@ impl Features {
             "bpdu-guard" | "bpduguard" => Some(self.bpdu_guard),
             "lldp" => Some(self.lldp),
             "telnet" => Some(self.telnet),
+            "openflow" => Some(self.openflow),
             _ => None,
         }
     }
@@ -678,6 +681,7 @@ impl Features {
             "bpdu-guard" | "bpduguard" => self.bpdu_guard = value,
             "lldp" => self.lldp = value,
             "telnet" => self.telnet = value,
+            "openflow" => self.openflow = value,
             _ => return Err(format!("unknown feature '{}'", name)),
         }
         Ok(())
@@ -694,6 +698,7 @@ impl Features {
             "bpdu-guard",
             "lldp",
             "telnet",
+            "openflow",
         ]
     }
 }
@@ -761,6 +766,7 @@ pub struct Switch {
     pub mac_table: MacTable,
     pub mac_aging: u16,
     pub lldp: LldpState,
+    pub openflow: crate::openflow::OpenFlow,
     pub startup_path: PathBuf,
     pub dirty: bool,
     pub uptime: Instant,
@@ -785,6 +791,7 @@ impl Switch {
             mac_table: MacTable::default(),
             mac_aging: DEFAULT_MAC_AGING_SECS,
             lldp: LldpState::default(),
+            openflow: crate::openflow::OpenFlow::new(system_mac),
             startup_path,
             dirty: false,
             uptime: Instant::now(),

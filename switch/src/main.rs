@@ -13,6 +13,7 @@ mod dataplane;
 mod lldp;
 mod md5;
 mod model;
+mod openflow;
 mod packet;
 mod stp;
 
@@ -291,6 +292,7 @@ fn run_daemon(args: &[String]) {
 
     let sw = Arc::new(Mutex::new(sw));
     let io = dataplane::Io::new(opts.dataplane);
+    openflow::spawn_manager(Arc::clone(&sw), Arc::clone(&io));
 
     let ports_explicit = opts.ports.is_some();
     if opts.dataplane {

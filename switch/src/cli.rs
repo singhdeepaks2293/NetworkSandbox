@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crate::lldp;
 use crate::model::*;
+use crate::openflow::{self, FailMode};
 use crate::packet;
 use crate::stp;
 
@@ -319,7 +320,7 @@ fn help(sess: &Session) -> String {
     match sess.mode {
         Mode::Exec => "  show          Inspect the switch\n  admin         Enter admin mode\n  quit          Exit the shell\n".to_string(),
         Mode::Priv => "  config        Enter configuration mode\n  show          Inspect the switch\n  save          Save the running configuration\n  clear         Clear tables/counters\n  debug stp     Trace spanning-tree events\n  user          Return to user mode\n  quit          Exit the shell\n".to_string(),
-        Mode::Config => "  device name NAME\n  vlan create ID [name NAME]\n  vlan delete ID\n  vlan ID\n  port IFNAME\n  bridge priority N\n  bridge hello N\n  bridge max-age N\n  bridge forward-delay N\n  feature enable|disable NAME\n  mac aging SEC\n  end / exit\n".to_string(),
+        Mode::Config => "  device name NAME\n  vlan create ID [name NAME]\n  vlan delete ID\n  vlan ID\n  port IFNAME\n  bridge priority N\n  bridge hello N\n  bridge max-age N\n  bridge forward-delay N\n  feature enable|disable NAME\n  openflow controller HOST [PORT]\n  openflow listen [PORT]\n  openflow fail-mode secure|standalone\n  openflow datapath-id ID\n  mac aging SEC\n  end / exit\n".to_string(),
         Mode::Interface(_) => "  mode access|trunk\n  access vlan N\n  native vlan N\n  allow vlans LIST|add|remove|except|none|all\n  edge on|off\n  guard on|off\n  link up|down\n  description TEXT\n  speed N | duplex full|half|auto\n  end / exit\n".to_string(),
         Mode::Vlan(_) => "  name NAME\n  state active|suspend\n  end / exit\n".to_string(),
     }
@@ -621,6 +622,8 @@ fn config_cmd(sw: &mut Switch, sess: &mut Session, cmd: &str, toks: &[&str], lin
             } else if toks.len() >= 2 && toks[1] == "logging" {
                 sw.logging_enabled = true;
                 String::new()
+            } else if toks.len() >= 2 && toks[1] == "openflow" {
+                openflow_cmd(sw, toks)
             } else {
                 error("invalid 'no' command")
             }
@@ -647,6 +650,7 @@ fn config_cmd(sw: &mut Switch, sess: &mut Session, cmd: &str, toks: &[&str], lin
             }
         }
         "spanning-tree" => span_global(sw, toks),
+        "openflow" => openflow_cmd(sw, toks),
         "feature" => {
             if toks.len() < 2 {
                 return incomplete();
@@ -706,6 +710,110 @@ fn remove_vlan(sw: &mut Switch, id: u16) {
     stp::refresh(sw);
 }
 
+fn openflow_cmd(sw: &mut Switch, toks: &[&str]) -> String {
+    if toks.len() < 2 {
+        return incomplete();
+    }
+    let sub = toks[1].to_ascii_lowercase();
+    if !sw.features.openflow && !matches!(sub.as_str(), "disable" | "no") {
+        return feature_off("openflow");
+    }
+    match sub.as_str() {
+        "controller" => {
+            if toks.len() < 3 {
+                return error("usage: openflow controller HOST [PORT]");
+            }
+            let host = toks[2].to_string();
+            let port = if toks.len() >= 4 {
+                match parse_u16(toks[3]) {
+                    Ok(p) if p != 0 => p,
+                    Ok(_) => return error("controller port must be 1..65535"),
+                    Err(e) => return error(&e),
+                }
+            } else {
+                6653
+            };
+            sw.openflow.config.controller = Some((host, port));
+            format!("OpenFlow controller set to {}:{}.\n", toks[2], port)
+        }
+        "listen" => {
+            let port = if toks.len() >= 3 {
+                match parse_u16(toks[2]) {
+                    Ok(p) if p != 0 => Some(p),
+                    Ok(_) => return error("listener port must be 1..65535"),
+                    Err(e) => return error(&e),
+                }
+            } else {
+                None
+            };
+            sw.openflow.config.controller = None;
+            sw.openflow.config.listen_port = port;
+            format!(
+                "OpenFlow listening on tcp:{}.\n",
+                sw.openflow.config.listening_port()
+            )
+        }
+        "fail-mode" => {
+            if toks.len() < 3 {
+                return error("usage: openflow fail-mode secure|standalone");
+            }
+            sw.openflow.config.fail_mode = match toks[2].to_ascii_lowercase().as_str() {
+                "secure" => FailMode::Secure,
+                "standalone" => FailMode::Standalone,
+                other => {
+                    return error(&format!(
+                        "unknown fail mode '{}' (secure|standalone)",
+                        other
+                    ))
+                }
+            };
+            format!("OpenFlow fail mode set to {}.\n", toks[2].to_ascii_lowercase())
+        }
+        "datapath-id" => {
+            if toks.len() < 3 {
+                return error("usage: openflow datapath-id ID");
+            }
+            let raw = toks[2].trim_start_matches("0x").trim_start_matches("0X");
+            let id = if toks[2].starts_with("0x") || toks[2].starts_with("0X") {
+                u64::from_str_radix(raw, 16)
+            } else {
+                toks[2].parse::<u64>()
+            };
+            match id {
+                Ok(v) => {
+                    sw.openflow.config.datapath_id = v;
+                    format!("OpenFlow datapath ID set to {:016x}.\n", v)
+                }
+                Err(_) => error(&format!("invalid datapath ID '{}'", toks[2])),
+            }
+        }
+        "disable" => {
+            sw.openflow.config.enabled = false;
+            sw.features.openflow = false;
+            sw.openflow.shared.clear_flows();
+            "OpenFlow disabled.\n".to_string()
+        }
+        "no" => {
+            if toks.len() >= 3 {
+                match toks[2].to_ascii_lowercase().as_str() {
+                    "controller" => {
+                        sw.openflow.config.controller = None;
+                        "OpenFlow controller removed.\n".to_string()
+                    }
+                    "listen" => {
+                        sw.openflow.config.listen_port = None;
+                        "OpenFlow listener reset to the default port.\n".to_string()
+                    }
+                    other => error(&format!("unknown 'no openflow {}'", other)),
+                }
+            } else {
+                incomplete()
+            }
+        }
+        other => error(&format!("unknown openflow command '{}'", other)),
+    }
+}
+
 fn set_feature(sw: &mut Switch, name: &str, enable: bool) -> String {
     let name = name.to_ascii_lowercase();
     let name = if name == "bpduguard" { "bpdu-guard" } else { &name };
@@ -762,6 +870,13 @@ fn set_feature(sw: &mut Switch, name: &str, enable: bool) -> String {
         }
         ("lldp", false) => {
             sw.lldp.clear();
+        }
+        ("openflow", true) => {
+            sw.openflow.config.enabled = true;
+        }
+        ("openflow", false) => {
+            sw.openflow.config.enabled = false;
+            sw.openflow.shared.clear_flows();
         }
         _ => {}
     }
@@ -1516,6 +1631,7 @@ fn show_cmd(sw: &mut Switch, toks: &[&str]) -> String {
         },
         "features" => show_features(sw),
         "lldp" => show_lldp(sw, toks),
+        "openflow" => openflow::show(sw),
         "logging" | "log" => show_logging(sw),
         "clock" => format!(
             "Uptime: {}\n",
@@ -2413,6 +2529,33 @@ pub fn running_config(sw: &Switch) -> String {
     let _ = writeln!(out, "!");
     let _ = writeln!(out, "mac aging {}", sw.mac_aging);
     let _ = writeln!(out, "!");
+    if sw.features.openflow && sw.openflow.config.enabled {
+        if let Some((host, port)) = &sw.openflow.config.controller {
+            let _ = writeln!(out, "openflow controller {} {}", host, port);
+        } else if sw.openflow.config.listen_port.is_some() {
+            let _ = writeln!(
+                out,
+                "openflow listen {}",
+                sw.openflow.config.listening_port()
+            );
+        }
+        let _ = writeln!(
+            out,
+            "openflow fail-mode {}",
+            match sw.openflow.config.fail_mode {
+                FailMode::Standalone => "standalone",
+                FailMode::Secure => "secure",
+            }
+        );
+        if sw.openflow.config.datapath_id != packet::mac_to_u64(sw.system_mac) {
+            let _ = writeln!(
+                out,
+                "openflow datapath-id {:016x}",
+                sw.openflow.config.datapath_id
+            );
+        }
+        let _ = writeln!(out, "!");
+    }
     for v in sw.vlans.values() {
         let _ = writeln!(out, "vlan {}", v.id);
         let _ = writeln!(out, " name {}", v.name);
